@@ -1,0 +1,22 @@
+#!/bin/bash -l
+
+#PBS -q qgpu
+#PBS -N synchrad
+#PBS -l select=1:ncpus=16:ngpus=1:mpiprocs=1:ompthreads=16,walltime=00:05:00
+#PBS -A DD-23-83
+
+cd ${PBS_O_WORKDIR}
+
+# Python interpreter & input script here
+# TODO: test with just python3 below, to check if it picks up the venv
+INTERPRETER=${HOME}/sw/karolina/gpu/venvs/synchrad/bin/python3
+SCRIPT=${PBS_O_WORKDIR}/opencl-addition-test.py
+
+# OpenMP threads
+export OMP_NUM_THREADS=16
+
+# run
+mpirun -n 1 bash -c "
+    export CUDA_VISIBLE_DEVICES=\${OMPI_COMM_WORLD_LOCAL_RANK};
+    ${INTERPRETER} ${SCRIPT}" \
+  > output_1_gpu.txt
