@@ -1,4 +1,4 @@
-Installation on Perlmutter (NERSC)
+Installation on Karolina (NERSC)
 ==================================
 
 `Perlmutter
