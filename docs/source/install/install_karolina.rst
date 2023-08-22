@@ -1,5 +1,3 @@
-.. _building-karolina:
-
 Installation on Karolina (IT4I)
 ==================================
 
@@ -118,7 +116,7 @@ Now, you can :ref:`submit Karolina compute jobs <running-karolina>` for ``fbpic`
 .. _building-karolina-update:
 
 Update ``fbpic`` & Dependencies
----------------------------
+-------------------------------
 
 If you already installed ``fbpic`` in the past and want to update it, start by getting the latest source code:
 
@@ -158,7 +156,7 @@ reflect the latest changes pulled from ``git``, without needing to reinstall the
 Running
 -------
 
-The batch script below can be used to run a ``fbpic`` simulation on two GPU nodes (change ``#PBS -l select=`` accordingly) on the supercomputer Karolina at IT4I.
+The batch script below can be used to run a ``fbpic`` simulation on TODO GPU nodes (change ``#PBS -l select=`` accordingly) on the supercomputer Karolina at IT4I.
 This partition has up to `72 nodes <https://docs.it4i.cz/karolina/hardware-overview/>`__.
 Every node has 8x A100 (40GB) GPUs and 2x AMD EPYC 7763, 64-core, 2.45 GHz processors.
 
