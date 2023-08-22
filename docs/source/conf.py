@@ -37,6 +37,8 @@ extensions = [
     'sphinx.ext.mathjax',
     'sphinx.ext.viewcode',
     'sphinx.ext.githubpages',
+    'sphinx_copybutton',
+    'sphinx_design'
 ]
 autoclass_content="init"
 
