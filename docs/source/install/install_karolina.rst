@@ -33,24 +33,24 @@ where ``dd-23-83`` is the project identifier, which can be different in your cas
 Preparation
 -----------
 
-Use the following commands to download the SynchRad source code:
+Use the following commands to download the ``fbpic`` source code:
 
 .. code-block:: bash
 
    # optionally, remove any previous installs if necessary
-   rm -rf $HOME/src/synchrad
-   rm -rf $HOME/sw/karolina/gpu/venvs/synchrad
+   rm -rf $HOME/src/fbpic
+   rm -rf $HOME/sw/karolina/gpu/venvs/fbpic
 
-   git clone https://github.com/berceanu/synchrad.git $HOME/src/synchrad
+   git clone https://github.com/berceanu/fbpic.git $HOME/src/fbpic
    
 On Karolina, we recommend running on the accelerator nodes with fast A100 GPUs.
 
-We use system software modules, add environment hints and further dependencies via the file ``$HOME/karolina_synchrad.profile``.
+We use system software modules, add environment hints and further dependencies via the file ``$HOME/karolina_fbpic.profile``.
 Create it now:
 
 .. code-block:: bash
 
-   cp $HOME/src/synchrad/Tools/machines/karolina-it4i/karolina_synchrad.profile.example $HOME/karolina_synchrad.profile
+   cp $HOME/src/fbpic/Tools/machines/karolina-it4i/karolina_fbpic.profile.example $HOME/karolina_fbpic.profile
 
 .. dropdown:: Script Details
    :color: light
@@ -59,10 +59,10 @@ Create it now:
 
    .. literalinclude:: ../../../Tools/machines/karolina-it4i/karolina_fbpic.profile.example
       :language: bash
-      :caption: ``$HOME/src/synchrad/Tools/machines/karolina-it4i/karolina_synchrad.profile.example``.
+      :caption: ``$HOME/src/fbpic/Tools/machines/karolina-it4i/karolina_fbpic.profile.example``.
 
 Edit the 2nd line of this script, which sets the ``export proj=""`` variable.
-For example, if you are member of the project ``DD-23-83``, then run ``vi $HOME/karolina_synchrad.profile``.
+For example, if you are member of the project ``DD-23-83``, then run ``vi $HOME/karolina_fbpic.profile``.
 Enter the edit mode by typing ``i`` and edit line 2 to read:
 
 .. code-block:: bash
@@ -77,18 +77,18 @@ Exit the ``vi`` editor with ``Esc`` and then type ``:wq`` (write & quit).
 
    .. code-block:: bash
 
-      source $HOME/karolina_synchrad.profile
+      source $HOME/karolina_fbpic.profile
    
    You can also add the line above to your ``$HOME/.bashrc`` file so that it is loaded on each login.
 
 Finally, since Karolina does not yet provide software modules for some of our dependencies, 
 install them once, and activate the newly created ``Python`` virtual environment. Further
-environment activations will be done automatically from inside ``karolina_synchrad.profile``.
+environment activations will be done automatically from inside ``karolina_fbpic.profile``.
 
 .. code-block:: bash
 
-   bash $HOME/src/synchrad/Tools/machines/karolina-it4i/install_dependencies.sh
-   source $HOME/sw/karolina/gpu/venvs/synchrad/bin/activate
+   bash $HOME/src/fbpic/Tools/machines/karolina-it4i/install_dependencies.sh
+   source $HOME/sw/karolina/gpu/venvs/fbpic/bin/activate
 
 .. dropdown:: Script Details
    :color: light
@@ -97,9 +97,9 @@ environment activations will be done automatically from inside ``karolina_synchr
 
    .. literalinclude:: ../../../Tools/machines/karolina-it4i/install_dependencies.sh
       :language: bash
-      :caption: ``$HOME/src/synchrad/Tools/machines/karolina-it4i/install_dependencies.sh``.
+      :caption: ``$HOME/src/fbpic/Tools/machines/karolina-it4i/install_dependencies.sh``.
 
-Finally, install ``SynchRad`` itself. This will install the package in "editable" mode,
+Finally, install ``fbpic`` itself. This will install the package in "editable" mode,
 meaning any changes you make to the local source code will immediately be reflected in the installed package:
 
 ..
@@ -109,27 +109,27 @@ meaning any changes you make to the local source code will immediately be reflec
 
 .. code-block:: bash
    
-   cd $HOME/src/synchrad
+   cd $HOME/src/fbpic
    python3 -m pip install -e .
 
-Now, you can :ref:`submit Karolina compute jobs <running-karolina>` for SynchRad Python scripts.
+Now, you can :ref:`submit Karolina compute jobs <running-karolina>` for ``fbpic`` Python scripts.
 
 
 .. _building-karolina-update:
 
-Update SynchRad & Dependencies
+Update ``fbpic`` & Dependencies
 ---------------------------
 
-If you already installed SynchRad in the past and want to update it, start by getting the latest source code:
+If you already installed ``fbpic`` in the past and want to update it, start by getting the latest source code:
 
 .. code-block:: bash
 
-   cd $HOME/src/synchrad
+   cd $HOME/src/fbpic
 
    # read the output of this command - does it look ok?
    git status
 
-   # get the latest SynchRad source code
+   # get the latest fbpic source code
    git fetch
    git pull
 
@@ -139,11 +139,11 @@ If you already installed SynchRad in the past and want to update it, start by ge
 
 And, if needed,
 
-- :ref:`update the karolina_synchrad.profile file <building-karolina-preparation>`,
+- :ref:`update the karolina_fbpic.profile file <building-karolina-preparation>`,
 - log out and into the system, activate the now updated environment profile as usual,
 - :ref:`execute the dependency install script <building-karolina-preparation>`.
 
-As a last step, reinstall ``SynchRad``: 
+As a last step, reinstall ``fbpic``: 
 
 .. code-block:: bash
    
@@ -158,7 +158,7 @@ reflect the latest changes pulled from ``git``, without needing to reinstall the
 Running
 -------
 
-The batch script below can be used to run a SynchRad simulation on two GPU nodes (change ``#PBS -l select=`` accordingly) on the supercomputer Karolina at IT4I.
+The batch script below can be used to run a ``fbpic`` simulation on two GPU nodes (change ``#PBS -l select=`` accordingly) on the supercomputer Karolina at IT4I.
 This partition has up to `72 nodes <https://docs.it4i.cz/karolina/hardware-overview/>`__.
 Every node has 8x A100 (40GB) GPUs and 2x AMD EPYC 7763, 64-core, 2.45 GHz processors.
 
@@ -172,14 +172,14 @@ Note that we run one MPI rank per GPU.
 
    .. literalinclude:: ../../../Tools/machines/karolina-it4i/karolina_gpu.qsub
       :language: bash
-      :caption: ``$HOME/src/synchrad/Tools/machines/karolina-it4i/karolina_gpu.qsub``.
+      :caption: ``$HOME/src/fbpic/Tools/machines/karolina-it4i/karolina_gpu.qsub``.
 
 To run a simulation, copy the lines above to a file ``karolina_gpu.qsub`` 
 
 .. code-block:: bash
    
-   mkdir -p $SCRDIR/runs/synchrad
-   cp $HOME/src/synchrad/Tools/machines/karolina-it4i/karolina_gpu.qsub $SCRDIR/runs/synchrad
+   mkdir -p $SCRDIR/runs/fbpic
+   cp $HOME/src/fbpic/Tools/machines/karolina-it4i/karolina_gpu.qsub $SCRDIR/runs/fbpic
 
 and run
 
@@ -189,7 +189,7 @@ and run
 
 .. code-block:: bash
 
-   cd $SCRDIR/runs/synchrad
+   cd $SCRDIR/runs/fbpic
    qsub karolina_gpu.qsub
 
 to submit the job.
