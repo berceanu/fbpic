@@ -43,3 +43,13 @@ python3 -m pip install --upgrade mpi4py --no-cache-dir --no-build-isolation --no
 python3 -m pip install --upgrade numba
 python3 -m pip install --upgrade mako
 python3 -m pip install --upgrade pyopencl
+
+#TODO
+    python3 -m pip install openpmd-viewer
+    python3 -m pip install pyvista
+    python3 -m pip install fbpic
+    python3 -m pip install fbpic[picmi]
+    python3 -m pip install --upgrade numba llvmlite tbb --user
+    python3 -m pip install cupy-cuda115
+    MPICC="cc -shared -target-accel=nvidia80" python3 -m pip install --force --no-cache-dir --no-binary=mpi4py mpi4py
+    python3 -m pip install pyfftw
