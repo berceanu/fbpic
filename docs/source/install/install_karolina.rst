@@ -102,7 +102,7 @@ meaning any changes you make to the local source code will immediately be reflec
 
 ..
   #TODO: replace editable install with normal install, via ``python3 -m pip install .``
-  #TODO: replace berceanu with hightower8083
+  #TODO: replace berceanu with fbpic
   #TODO: open PR for Sphinx documentation
 
 .. code-block:: bash
