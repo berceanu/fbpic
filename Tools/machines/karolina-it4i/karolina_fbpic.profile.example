@@ -15,25 +15,14 @@ ml OpenMPI/4.1.4-GCC-11.3.0-CUDA-11.7.0
 
 ml git/2.36.0-GCCcore-11.3.0-nodocs
 
-#TODO
-  ml gnutools
-  ml openmpi_ib
-  ml python/2.7-anaconda
-  ml GCC/8.3.0
-  ml MVAPICH2/2.3.3-GDR
-  ml python/3.6
-  ml PrgEnv-gnu cpe-cuda cudatoolkit python
-  ml python cudatoolkit
-  ml gcc
-  ml fftw
-  ml python/3.7.0-anaconda3-5.3.0
-  ml cuda/9.1.85
+# TODO: remove
+#ml CuPy/8.5.0-fosscuda-2020b 
 
 
 # Python virtual env
-if [ -d "${HOME}/sw/karolina/gpu/venvs/synchrad" ]
+if [ -d "${HOME}/sw/karolina/gpu/venvs/fbpic" ]
 then
-  source ${HOME}/sw/karolina/gpu/venvs/synchrad/bin/activate
+  source ${HOME}/sw/karolina/gpu/venvs/fbpic/bin/activate
 fi
 
 # compiler environment hints

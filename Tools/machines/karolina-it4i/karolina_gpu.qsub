@@ -1,16 +1,15 @@
 #!/bin/bash -l
 
 #PBS -q qgpu
-#PBS -N synchrad
-#PBS -l select=1:ncpus=16:ngpus=1:mpiprocs=1:ompthreads=16,walltime=00:05:00
+#PBS -N fbpic
+#PBS -l select=1:ncpus=16:ngpus=1:mpiprocs=1:ompthreads=16,walltime=00:10:00
 #PBS -A DD-23-83
 
 cd ${PBS_O_WORKDIR}
 
 # Python interpreter & input script here
-# TODO: test with just python3 below, to check if it picks up the venv
-INTERPRETER=${HOME}/sw/karolina/gpu/venvs/synchrad/bin/python3
-SCRIPT=${PBS_O_WORKDIR}/opencl-addition-test.py
+INTERPRETER=python3
+SCRIPT=${PBS_O_WORKDIR}/fbpic_script.py
 
 # OpenMP threads
 export OMP_NUM_THREADS=16
