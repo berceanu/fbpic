@@ -43,6 +43,7 @@ python3 -m pip install --upgrade mpi4py --no-cache-dir --no-build-isolation --no
 # TODO: remove commented lines
 #MPICC="cc -shared -target-accel=nvidia80" python3 -m pip install --upgrade --force --no-cache-dir --no-build-isolation --no-binary=mpi4py mpi4py
 #python3 -m pip install --upgrade llvmlite tbb
+# TODO: remove synchrad dependencies
 python3 -m pip install --upgrade mako
 python3 -m pip install --upgrade pyopencl
 python3 -m pip install --upgrade numba
