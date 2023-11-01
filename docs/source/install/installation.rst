@@ -15,7 +15,6 @@ This page explains how to install FBPIC on different plateforms:
    install_juwels
    install_lawrencium
    install_comet
-   install_cori
    install_perlmutter
    install_summit
    install_karolina
