@@ -9,27 +9,31 @@ Apart from synthactic details, this file is very close to cuda_methods.py
 """
 
 from numba import jit, prange
-import random
 import math
 from scipy.constants import c
+from fbpic.utils.random_seed import _synchrotron_random
 
 # Import inline functions
 from .inline_functions import get_angles, get_particle_radiation, \
-    get_linear_coefficients
+    get_linear_coefficients, get_particle_lab_frame, \
+    get_fields_lab_frame
 
 # Compile the inline functions for GPU
 get_angles = jit( get_angles, nopython=True )
 get_particle_radiation = jit( get_particle_radiation, nopython=True )
 get_linear_coefficients = jit( get_linear_coefficients, nopython=True  )
+get_particle_lab_frame = jit( get_particle_lab_frame, nopython=True )
+get_fields_lab_frame = jit( get_fields_lab_frame, nopython=True )
 
 @jit(cache=True, parallel=False, forceobj=True)
-def gather_synchrotron_numba(
+def gather_synchrotron_numba_boosted(
     N_tot,
     ux, uy, uz, Ex, Ey, Ez,
     Bx, By, Bz, w, gamma_inv,
     Larmore_factor_density,
     Larmore_factor_momentum,
-    gamma_cutoff_inv, radiation_reaction,
+    gamma_cutoff_inv,
+    gamma_boost, beta_boost,
     omega_ax, SR_dxi, SR_xi_data,
     theta_x_min, theta_x_max, d_th_x,
     theta_y_min, theta_y_max, d_th_y,
@@ -67,8 +71,9 @@ def gather_synchrotron_numba(
     gamma_cutoff_inv: float
         Reciprocal of the Lorentz factor below which particles are discarded
 
-    radiation_reaction: bool
-        Whether to consider radiation reaction on the electrons
+    gamma_boost, beta_boost: floats
+        Lorentz factor and normalized velocity between the lab and
+        simulation frames
 
     omega_ax: 1D vector of floats
         frequencies on which spectrum is calculated
@@ -105,6 +110,75 @@ def gather_synchrotron_numba(
     """
     for ip in prange( N_tot ):
 
+        ux_lab, uy_lab, uz_lab, gamma_inv_lab, dt_ratio = \
+            get_particle_lab_frame(
+                ux[ip], uy[ip], uz[ip], gamma_inv[ip],
+                gamma_boost, beta_boost
+            )
+
+        if  (gamma_inv_lab >= gamma_cutoff_inv):
+            continue
+
+        theta_x, theta_y = get_angles(
+            ux_lab, uy_lab, uz_lab
+        )
+
+        theta_diffusion = 2**-1.5 * gamma_inv_lab
+        theta_x += _synchrotron_random.gauss(0, theta_diffusion)
+        theta_y += _synchrotron_random.gauss(0, theta_diffusion)
+
+        if   (theta_x >= theta_x_max) \
+          or (theta_y >= theta_y_max) \
+          or (theta_x <= theta_x_min) \
+          or (theta_y <= theta_y_min):
+            continue
+
+        th_ix, s0_x, s1_x = get_linear_coefficients(
+            theta_x, theta_x_min, d_th_x
+        )
+        th_iy, s0_y, s1_y = get_linear_coefficients(
+            theta_y, theta_y_min, d_th_y
+        )
+
+        Ex_lab, Ey_lab, Ez_lab, cBx_lab, cBy_lab, cBz_lab = \
+            get_fields_lab_frame(
+                Ex[ip], Ey[ip], Ez[ip],
+                c*Bx[ip], c*By[ip], c*Bz[ip],
+                gamma_boost, beta_boost
+            )
+
+        spect_loc, ux_ph, uy_ph, uz_ph = get_particle_radiation(
+                ux_lab, uy_lab, uz_lab, w[ip],
+                Ex_lab, Ey_lab, Ez_lab,
+                cBx_lab, cBy_lab, cBz_lab,
+                gamma_inv_lab,
+                Larmore_factor_density * dt_ratio,
+                Larmore_factor_momentum * dt_ratio,
+                SR_dxi, SR_xi_data,
+                omega_ax, spect_loc
+        )
+
+        radiation_data[th_ix, th_iy, :] += spect_loc * s0_x * s0_y
+        radiation_data[th_ix, th_iy+1, :] += spect_loc * s0_x * s1_y
+        radiation_data[th_ix+1, th_iy, :] += spect_loc * s1_x * s0_y
+        radiation_data[th_ix+1, th_iy+1, :] += spect_loc * s1_x * s1_y
+
+
+@jit(cache=True, parallel=False, forceobj=True)
+def gather_synchrotron_numba(
+    N_tot,
+    ux, uy, uz, Ex, Ey, Ez,
+    Bx, By, Bz, w, gamma_inv,
+    Larmore_factor_density,
+    Larmore_factor_momentum,
+    gamma_cutoff_inv, radiation_reaction,
+    omega_ax, SR_dxi, SR_xi_data,
+    theta_x_min, theta_x_max, d_th_x,
+    theta_y_min, theta_y_max, d_th_y,
+    spect_loc, radiation_data):
+    """Accumulate radiation for an unboosted simulation."""
+    for ip in prange( N_tot ):
+
         if  (gamma_inv[ip] >= gamma_cutoff_inv):
             continue
 
@@ -113,8 +187,8 @@ def gather_synchrotron_numba(
         )
 
         theta_diffusion = 2**-1.5 * gamma_inv[ip]
-        theta_x += random.gauss(0, theta_diffusion)
-        theta_y += random.gauss(0, theta_diffusion)
+        theta_x += _synchrotron_random.gauss(0, theta_diffusion)
+        theta_y += _synchrotron_random.gauss(0, theta_diffusion)
 
         if   (theta_x >= theta_x_max) \
           or (theta_y >= theta_y_max) \

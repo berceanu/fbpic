@@ -81,7 +81,7 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         )
 
         self.mesh_origin = np.array([
-            sr_object.theta_x_min, sr_object.theta_x_min,
+            sr_object.theta_x_min, sr_object.theta_y_min,
             sr_object.omega_min * hbar
         ])
 

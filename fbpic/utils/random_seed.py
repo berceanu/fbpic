@@ -5,11 +5,18 @@
 This file is part of the Fourier-Bessel Particle-In-Cell code (FB-PIC)
 It provides a function to fix the random seed in FBPIC runs.
 """
+import random
+
 import numpy as np
+
 from .mpi import MPI
 from .cuda import cupy_installed
 if cupy_installed:
     import cupy
+
+
+# Keep synchrotron sampling independent of stochastic particle dynamics.
+_synchrotron_random = random.Random()
 
 
 def set_random_seed( random_seed ):
@@ -18,12 +25,15 @@ def set_random_seed( random_seed ):
 
     Fixing a seed helps ensure that repeatedly running the
     same simulation gives the same result (despite the Monte Carlo
-    parts of the code, e.g. ionization, gaussian beam generation, etc.)
+    parts of the code, e.g. ionization, gaussian beam generation, and
+    synchrotron angular sampling.)
 
     random_seed: int
         The seed of the random number generator.
     """
     # Use a different seed for each MPI rank
+    # - Set the independent synchrotron angular-sampling seed
+    _synchrotron_random.seed( random_seed + MPI.COMM_WORLD.rank )
     # - Set seed for numpy
     np.random.seed( random_seed + MPI.COMM_WORLD.rank )
     if cupy_installed:

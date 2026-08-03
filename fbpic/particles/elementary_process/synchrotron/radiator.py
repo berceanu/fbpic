@@ -14,7 +14,8 @@ from scipy.integrate import IntegrationWarning
 import warnings
 
 from ..cuda_numba_utils import allocate_empty
-from .numba_methods import gather_synchrotron_numba
+from .numba_methods import gather_synchrotron_numba, \
+    gather_synchrotron_numba_boosted
 
 warnings.simplefilter('ignore', category=NumbaPerformanceWarning)
 warnings.simplefilter('ignore', category=IntegrationWarning)
@@ -22,11 +23,18 @@ warnings.simplefilter('ignore', category=IntegrationWarning)
 # Check if CUDA is available, then import CUDA functions
 from fbpic.utils.cuda import cuda_installed
 from fbpic.utils.printing import catch_gpu_memory_error
+from fbpic.utils.random_seed import _synchrotron_random
 if cuda_installed:
     import cupy
     from fbpic.utils.cuda import cuda_tpb_bpg_1d
     from .cuda_methods import gather_synchrotron_cuda
     from numba.cuda.random import create_xoroshiro128p_states
+
+
+def _get_cuda_rng_seed():
+    """Return a reproducible, high-entropy seed for CUDA angle sampling."""
+    return _synchrotron_random.randrange(0, 1 << 63)
+
 
 class SynchrotronRadiator(object):
     """
@@ -34,7 +42,7 @@ class SynchrotronRadiator(object):
     """
     def __init__(self, radiating_species, photon_energy_axis,
                  theta_x_axis, theta_y_axis, gamma_cutoff,
-                 radiation_reaction, x_max, nSamples):
+                 radiation_reaction, x_max, nSamples, boost=None):
         """
         Initialize a Radiator instance
 
@@ -70,11 +78,27 @@ class SynchrotronRadiator(object):
 
         nSamples: integer
             number of sampling points for the spectral profile function
+
+        boost: a BoostConverter object or None
+            Defines the Lorentz boost from the laboratory frame to the
+            simulation frame. Output axes and radiation are in the lab frame.
         """
         # Register a few parameters
         self.use_cuda = radiating_species.use_cuda
         self.eon = radiating_species
         self.dt = radiating_species.dt
+        if boost is None:
+            self.gamma_boost = 1.0
+            self.beta_boost = 0.0
+        else:
+            self.gamma_boost = boost.gamma0
+            self.beta_boost = boost.beta0
+
+        if self.beta_boost != 0.0 and radiation_reaction:
+            raise NotImplementedError(
+                "Radiation reaction is not supported with boosted-frame "
+                "synchrotron radiation.")
+
         self.gamma_cutoff_inv = 1. / gamma_cutoff
         self.radiation_reaction = radiation_reaction
 
@@ -124,6 +148,9 @@ class SynchrotronRadiator(object):
         # Process radiating particles into batches
         self.batch_size = 10
 
+        self.rng_states_batch = None
+        self.rng_states_size = 0
+
     def initialize_S_function( self, x_max, nSamples ):
         """
         Initialize spectral profile function
@@ -142,7 +169,11 @@ class SynchrotronRadiator(object):
                         * quad(k_53, x, np.inf)[0]
         S0 =  np.vectorize(S0)
         x_ax = np.linspace(0, x_max, nSamples)
-        self.S_func_data = S0(x_ax)
+        self.S_func_data = np.empty_like(x_ax)
+        # S(x) tends to zero at the origin although its Bessel integral
+        # diverges there. Use the analytic limit and integrate only x > 0.
+        self.S_func_data[0] = 0.0
+        self.S_func_data[1:] = S0(x_ax[1:])
         self.S_func_dx = x_ax[1] - x_ax[0]
 
     @catch_gpu_memory_error
@@ -163,12 +194,17 @@ class SynchrotronRadiator(object):
 
             # Allocate a container for spectral profiles for the
             # particles in the batch
-            spect_batch = allocate_empty( (N_batch, self.N_omega), self.use_cuda,
-                                          dtype=np.double )
+            spect_batch = allocate_empty(
+                (N_batch, self.N_omega), self.use_cuda, dtype=np.double
+            )
 
-            # initialize states for random number generator
-            seed = np.random.randint( 256 )
-            rng_states_batch = create_xoroshiro128p_states(N_batch, seed)
+            # Preserve RNG state between timesteps. Reallocate only when a
+            # growing particle population requires additional batch states.
+            if N_batch > self.rng_states_size:
+                seed = _get_cuda_rng_seed()
+                self.rng_states_batch = create_xoroshiro128p_states(
+                    N_batch, seed)
+                self.rng_states_size = N_batch
 
             # run kernel for radiation calculation
             batch_grid_1d, batch_block_1d = cuda_tpb_bpg_1d( N_batch )
@@ -179,27 +215,42 @@ class SynchrotronRadiator(object):
                 self.Larmore_factor_density,
                 self.Larmore_factor_momentum,
                 self.gamma_cutoff_inv, self.radiation_reaction,
+                self.gamma_boost, self.beta_boost,
                 self.omega_ax, self.S_func_dx, self.S_func_data,
                 self.theta_x_min, self.theta_x_max, self.d_theta_x,
                 self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                spect_batch, rng_states_batch, self.radiation_data)
+                spect_batch, self.rng_states_batch, self.radiation_data)
         else:
             # Allocate array for the single particle spectral profile
             spect_loc = allocate_empty( (self.N_omega,), self.use_cuda,
                                         dtype=np.double )
 
             # radiation calculation (parallel loop over particle)
-            gather_synchrotron_numba(
-                eon.Ntot,
-                eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
-                eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
-                self.Larmore_factor_density,
-                self.Larmore_factor_momentum,
-                self.gamma_cutoff_inv, self.radiation_reaction,
-                self.omega_ax, self.S_func_dx, self.S_func_data,
-                self.theta_x_min, self.theta_x_max, self.d_theta_x,
-                self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                spect_loc, self.radiation_data)
+            if self.beta_boost == 0.0:
+                gather_synchrotron_numba(
+                    eon.Ntot,
+                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
+                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
+                    self.Larmore_factor_density,
+                    self.Larmore_factor_momentum,
+                    self.gamma_cutoff_inv, self.radiation_reaction,
+                    self.omega_ax, self.S_func_dx, self.S_func_data,
+                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
+                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
+                    spect_loc, self.radiation_data)
+            else:
+                gather_synchrotron_numba_boosted(
+                    eon.Ntot,
+                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
+                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
+                    self.Larmore_factor_density,
+                    self.Larmore_factor_momentum,
+                    self.gamma_cutoff_inv,
+                    self.gamma_boost, self.beta_boost,
+                    self.omega_ax, self.S_func_dx, self.S_func_data,
+                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
+                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
+                    spect_loc, self.radiation_data)
 
     def send_to_gpu( self ):
         """

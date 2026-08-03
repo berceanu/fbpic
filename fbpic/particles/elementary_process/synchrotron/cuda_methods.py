@@ -15,12 +15,17 @@ import math
 
 # Import inline functions
 from .inline_functions import get_angles, get_particle_radiation, \
-    get_linear_coefficients
+    get_linear_coefficients, get_particle_lab_frame, \
+    get_fields_lab_frame
 
 # Compile the inline functions for GPU
 get_angles = cuda.jit( get_angles, device=True, inline=True)
 get_particle_radiation = cuda.jit( get_particle_radiation, device=True, inline=True )
 get_linear_coefficients = cuda.jit( get_linear_coefficients, device=True, inline=True )
+get_particle_lab_frame = cuda.jit(
+    get_particle_lab_frame, device=True, inline=True)
+get_fields_lab_frame = cuda.jit(
+    get_fields_lab_frame, device=True, inline=True)
 
 @cuda.jit
 def gather_synchrotron_cuda(
@@ -30,6 +35,7 @@ def gather_synchrotron_cuda(
     Larmore_factor_density,
     Larmore_factor_momentum,
     gamma_cutoff_inv, radiation_reaction,
+    gamma_boost, beta_boost,
     omega_ax, SR_dxi, SR_xi_data,
     theta_x_min, theta_x_max, d_th_x,
     theta_y_min, theta_y_max, d_th_y,
@@ -75,6 +81,10 @@ def gather_synchrotron_cuda(
 
     radiation_reaction: bool
         Whether to consider radiation reaction on the electrons
+
+    gamma_boost, beta_boost: floats
+        Lorentz factor and normalized velocity between the lab and
+        simulation frames
 
     omega_ax: 1D vector of floats
         frequencies on which spectrum is calculated
@@ -122,12 +132,19 @@ def gather_synchrotron_cuda(
         N_max = min( (i_batch+1)*batch_size, Ntot )
         for ip in range( i_batch*batch_size, N_max ):
 
-            if (gamma_inv[ip] >= gamma_cutoff_inv):
+            ux_lab, uy_lab, uz_lab, gamma_inv_lab, dt_ratio = \
+                get_particle_lab_frame(
+                    ux[ip], uy[ip], uz[ip], gamma_inv[ip],
+                    gamma_boost, beta_boost
+                )
+
+            if (gamma_inv_lab >= gamma_cutoff_inv):
                 continue
 
-            theta_x, theta_y = get_angles( ux[ip], uy[ip], uz[ip] )
+            theta_x, theta_y = get_angles(
+                ux_lab, uy_lab, uz_lab )
 
-            theta_diffusion = 2**-1.5 * gamma_inv[ip]
+            theta_diffusion = 2**-1.5 * gamma_inv_lab
             theta_x += theta_diffusion * xoroshiro128p_normal_float64(
                 rng_states_batch, i_batch)
             theta_y += theta_diffusion * xoroshiro128p_normal_float64(
@@ -144,13 +161,20 @@ def gather_synchrotron_cuda(
             th_iy, s0_y, s1_y = get_linear_coefficients(
                 theta_y, theta_y_min, d_th_y )
 
-            spect_loc, ux_ph, uy_ph, uz_ph = get_particle_radiation(
-                    ux[ip], uy[ip], uz[ip], w[ip],
+            Ex_lab, Ey_lab, Ez_lab, cBx_lab, cBy_lab, cBz_lab = \
+                get_fields_lab_frame(
                     Ex[ip], Ey[ip], Ez[ip],
                     c*Bx[ip], c*By[ip], c*Bz[ip],
-                    gamma_inv[ip],
-                    Larmore_factor_density,
-                    Larmore_factor_momentum,
+                    gamma_boost, beta_boost
+                )
+
+            spect_loc, ux_ph, uy_ph, uz_ph = get_particle_radiation(
+                    ux_lab, uy_lab, uz_lab, w[ip],
+                    Ex_lab, Ey_lab, Ez_lab,
+                    cBx_lab, cBy_lab, cBz_lab,
+                    gamma_inv_lab,
+                    Larmore_factor_density * dt_ratio,
+                    Larmore_factor_momentum * dt_ratio,
                     SR_dxi, SR_xi_data,
                     omega_ax, spect_loc
             )

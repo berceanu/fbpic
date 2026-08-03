@@ -484,18 +484,26 @@ class Particles(object) :
         gamma_cutoff: float, optional
             Minimal particle gamma factor for which radiation is calculated
 
-        radiation_reaction: bool
-            Whether to consider radiation reaction on the electrons
+        radiation_reaction: bool, optional
+            Whether to consider radiation reaction on the electrons.
+            This is not supported when a nonidentity ``boost`` is supplied;
+            that combination raises ``NotImplementedError``.
 
         x_max: float, optional
             Extent of the sampling used for the spectral profile function
 
         nSamples: integer, optional
             number of sampling points for the spectral profile function
+
+        boost: a BoostConverter object or None, optional
+            Defines the Lorentz boost from the laboratory frame to the
+            simulation frame. The energy and angular axes, ``gamma_cutoff``,
+            and accumulated radiation are interpreted in the lab frame.
+
         """
         self.synchrotron_radiator = SynchrotronRadiator(
             self, photon_energy_axis, theta_x_axis, theta_y_axis,
-            gamma_cutoff, radiation_reaction, x_max, nSamples
+            gamma_cutoff, radiation_reaction, x_max, nSamples, boost
         )
 
     def make_ionizable(self, element, target_species,
