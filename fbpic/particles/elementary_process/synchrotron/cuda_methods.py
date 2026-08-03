@@ -74,7 +74,7 @@ def gather_synchrotron_cuda(
 
     Larmore_factor_momentum: float
         Normalization factor for the photon momentum,
-        `e**2 * dt / ( 6 * np.pi * epsilon_0 * c**2 )`
+        ``e**2 * dt / (6 * pi * epsilon_0 * m_e * c**3)``
 
     gamma_cutoff_inv: float
         Reciprocal of the Lorentz factor below which particles are discarded

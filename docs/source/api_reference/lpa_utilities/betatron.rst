@@ -149,8 +149,17 @@ laboratory energy-angle grid, so no photon energy-angle Jacobian is needed.
 
 A macroparticle weight is the number of represented particles and is a
 Lorentz scalar.  It therefore multiplies the reconstructed single-particle
-emission without an additional boost factor.  For radiation data :math:`R`,
-the accumulated energy represented by the output grid is
+emission without an additional boost factor.  The output quantity is the
+spectral-angular density
+
+.. math::
+
+    R = \frac{\partial^3 E_{\mathrm{rad}}}
+      {\partial(\hbar\omega)\,\partial\theta_x\,\partial\theta_y}.
+
+Since radians are dimensionless in SI, :math:`R` is dimensionless (and may
+also be read as per radian squared).  The accumulated energy represented by
+the output grid is
 
 .. math::
 

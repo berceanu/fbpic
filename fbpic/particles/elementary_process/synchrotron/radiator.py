@@ -49,7 +49,8 @@ class SynchrotronRadiator(object):
         Parameters
         ----------
         radiating_species: an fbpic.Particles object
-            This object is not modified
+            Its momentum arrays are modified only when
+            ``radiation_reaction=True``.
 
         photon_energy_axis: tuple
             Parameters for the photon energy axis provided as

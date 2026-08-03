@@ -211,7 +211,7 @@ def get_particle_radiation(
 
     Larmore_factor_momentum: float
         Normalization factor for the photon momentum,
-        `e**2 * dt / ( 6 * np.pi * epsilon_0 * c**2 )`
+        ``e**2 * dt / (6 * pi * epsilon_0 * m_e * c**3)``
 
     omega_ax: 1D vector of floats
         frequencies on which spectrum is calculated
