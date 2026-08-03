@@ -190,9 +190,11 @@ def test_lab_reconstruction_against_tensor_oracle(
     gamma_lab = math.sqrt(1.0 + np.dot(u_lab, u_lab))
     gamma_sim = 1.0 / gamma_inv_sim
     assert np.allclose(reconstructed[:3], u_lab, rtol=2.0e-13, atol=2.0e-13)
-    assert np.isclose(1.0 / reconstructed[3], gamma_lab, rtol=2.0e-13)
+    assert np.isclose(
+        1.0 / reconstructed[3], gamma_lab, rtol=2.0e-13, atol=0.0
+    )
     assert np.isclose(reconstructed[4], gamma_lab / gamma_sim,
-                      rtol=2.0e-13)
+                      rtol=2.0e-13, atol=0.0)
     assert np.allclose(fields[:3], E_lab, rtol=3.0e-13, atol=3.0e-3)
     assert np.allclose(fields[3:], cB_lab, rtol=3.0e-13, atol=3.0e-3)
 
@@ -229,13 +231,15 @@ def test_closed_form_boost_sign_and_synchrotron_scalars():
         uz_lab - beta_boost * gamma_lab
     )
     assert np.isclose(1.0 / gamma_inv_sim, expected_gamma_sim,
-                      rtol=2.0e-14)
-    assert np.isclose(u_sim[2], expected_uz_sim, rtol=2.0e-14)
+                      rtol=2.0e-14, atol=0.0)
+    assert np.isclose(
+        u_sim[2], expected_uz_sim, rtol=2.0e-14, atol=0.0
+    )
     assert np.isclose(E_sim[0],
                       -gamma_boost * beta_boost * field_amplitude,
-                      rtol=2.0e-14)
+                      rtol=2.0e-14, atol=0.0)
     assert np.isclose(cB_sim[1], gamma_boost * field_amplitude,
-                      rtol=2.0e-14)
+                      rtol=2.0e-14, atol=0.0)
 
     recovered_fields = get_fields_lab_frame(
         *E_sim, *cB_sim, gamma_boost, beta_boost
@@ -255,8 +259,8 @@ def test_closed_form_boost_sign_and_synchrotron_scalars():
     )**2
     expected_omega_c = 1.5 * gamma_lab**2 * \
         cyclotron_frequency / beta_particle
-    assert np.isclose(power, expected_power, rtol=2.0e-14)
-    assert np.isclose(omega_c, expected_omega_c, rtol=2.0e-14)
+    assert np.isclose(power, expected_power, rtol=2.0e-14, atol=0.0)
+    assert np.isclose(omega_c, expected_omega_c, rtol=2.0e-14, atol=0.0)
 
 
 @pytest.mark.parametrize("gamma_boost", [1.0e2, 1.0e4, 1.0e6])
@@ -289,9 +293,13 @@ def test_lightfront_transform_is_stable_for_lab_rest(gamma_boost):
         0.0, 0.0, -gamma_boost * beta_boost,
         1.0 / gamma_boost, gamma_boost, beta_boost
     )
-    assert np.isclose(1.0 / recovered[3], 1.0, rtol=5.0e-11)
+    assert np.isclose(
+        1.0 / recovered[3], 1.0, rtol=5.0e-11, atol=0.0
+    )
     assert np.isclose(recovered[2], 0.0, atol=5.0e-11)
-    assert np.isclose(recovered[4], 1.0 / gamma_boost, rtol=5.0e-11)
+    assert np.isclose(
+        recovered[4], 1.0 / gamma_boost, rtol=5.0e-11, atol=0.0
+    )
 
 
 @pytest.mark.parametrize(
@@ -403,7 +411,9 @@ def test_forward_worldline_time_conversion_trap():
         4.0, u_lab, E_lab, cB_lab
     )
     dt_ratio = gamma_lab * inv_gamma_sim
-    assert np.isclose(dt_ratio, 7.869983689729365, rtol=5.0e-14)
+    assert np.isclose(
+        dt_ratio, 7.869983689729365, rtol=5.0e-14, atol=0.0
+    )
 
     _, omega_c = _power_and_critical_frequency(u_lab, E_lab, cB_lab)
     energy = (0.2 * hbar * omega_c, 2.0 * hbar * omega_c, 32)
@@ -438,7 +448,7 @@ def test_forward_worldline_time_conversion_trap():
     )
     assert np.isclose(
         omitted_time_factor.sum() / lab.sum(),
-        1.0 / dt_ratio, rtol=2.0e-13
+        1.0 / dt_ratio, rtol=2.0e-13, atol=0.0
     )
 
 
@@ -475,7 +485,9 @@ def test_spectrum_power_critical_energy_and_weight_oracle():
 
     emitted_on_grid = trapezoid(spectrum, radiator.omega_ax * hbar)
     expected_on_grid = weight * power * dt * trapezoid(profile, xi)
-    assert np.isclose(emitted_on_grid, expected_on_grid, rtol=1.0e-2)
+    assert np.isclose(
+        emitted_on_grid, expected_on_grid, rtol=1.0e-2, atol=0.0
+    )
 
 
 def test_force_free_and_parallel_curvature_are_zero():
@@ -575,8 +587,8 @@ def test_boosted_angular_statistics_and_cpu_reproducibility():
     mean_tolerance = 5.0 * sigma / math.sqrt(count)
     assert abs(x_mean - 0.5 * np.pi) < mean_tolerance
     assert abs(y_mean) < mean_tolerance
-    assert np.isclose(x_var, sigma**2, rtol=0.05)
-    assert np.isclose(y_var, sigma**2, rtol=0.05)
+    assert np.isclose(x_var, sigma**2, rtol=0.05, atol=0.0)
+    assert np.isclose(y_var, sigma**2, rtol=0.05, atol=0.0)
 
 
 def _run_uniform_bz_simulation(
@@ -752,12 +764,23 @@ def test_equivalent_lab_and_boosted_simulations(tmp_path):
         )
         total_8 = output.snapshots[8].sum()
         total_16 = output.snapshots[16].sum()
-        assert np.isclose(total_16, 2.0 * total_8, rtol=2.0e-10)
+        assert np.isclose(
+            total_16, 2.0 * total_8, rtol=2.0e-10, atol=0.0
+        )
 
         energy_axis, theta_x_axis, theta_y_axis = output.axes
-        assert np.allclose(output.info.x, np.linspace(*theta_x_axis))
-        assert np.allclose(output.info.y, np.linspace(*theta_y_axis))
-        assert np.allclose(output.info.z, np.linspace(*energy_axis))
+        assert np.allclose(
+            output.info.x, np.linspace(*theta_x_axis),
+            rtol=2.0e-15, atol=0.0
+        )
+        assert np.allclose(
+            output.info.y, np.linspace(*theta_y_axis),
+            rtol=2.0e-15, atol=0.0
+        )
+        assert np.allclose(
+            output.info.z, np.linspace(*energy_axis),
+            rtol=2.0e-15, atol=0.0
+        )
         assert output.info.axes == {0: "x", 1: "y", 2: "z"}
 
     lab_data = lab.snapshots[16]
@@ -765,7 +788,10 @@ def test_equivalent_lab_and_boosted_simulations(tmp_path):
     scale = np.max(lab_data)
     assert np.array_equal(lab_state, plain_lab_state)
     assert np.array_equal(boosted_state, plain_boosted_state)
-    assert np.allclose(boosted_lab_momentum, lab_momentum, rtol=2.0e-13)
+    assert np.allclose(
+        boosted_lab_momentum, lab_momentum,
+        rtol=2.0e-13, atol=2.0e-13
+    )
     assert np.allclose(boosted_data, lab_data, rtol=2.0e-10,
                        atol=2.0e-12 * scale)
     for axes in ((0, 1), (0, 2), (1, 2)):
@@ -961,8 +987,8 @@ def test_ultrarelativistic_power_stability_cpu():
     boosted, _, _ = _get_ultrarelativistic_spectrum(False, True)
     assert np.isfinite(lab).all()
     assert lab.sum() > 0.0
-    assert np.allclose(lab, expected, rtol=1.0e-2)
-    assert np.allclose(boosted, lab, rtol=2.0e-11)
+    assert np.allclose(lab, expected, rtol=1.0e-2, atol=0.0)
+    assert np.allclose(boosted, lab, rtol=2.0e-11, atol=0.0)
 
 
 @pytest.mark.skipif(not cuda_installed, reason="CUDA hardware is unavailable")
@@ -970,9 +996,9 @@ def test_ultrarelativistic_power_cpu_cuda():
     """CPU and CUDA agree on energy-resolved stable power and total energy."""
     cpu, _, energy = _get_ultrarelativistic_spectrum(False, True)
     gpu, _, _ = _get_ultrarelativistic_spectrum(True, True)
-    assert np.allclose(gpu, cpu, rtol=2.0e-11)
+    assert np.allclose(gpu, cpu, rtol=2.0e-11, atol=0.0)
     assert np.isclose(trapezoid(gpu, energy), trapezoid(cpu, energy),
-                      rtol=2.0e-11)
+                      rtol=2.0e-11, atol=0.0)
 
 
 @pytest.mark.skipif(not cuda_installed, reason="CUDA hardware is unavailable")
@@ -1118,18 +1144,21 @@ def test_cuda_cpu_identity_and_boosted_population_parity():
             gpu[1], cpu[1], rtol=5.0e-12,
             atol=5.0e-14 * cpu[1].max()
         )
-        assert np.isclose(gpu[2], cpu[2], rtol=5.0e-12)
+        assert np.isclose(gpu[2], cpu[2], rtol=5.0e-12, atol=0.0)
         assert np.all(
             np.abs(gpu[3][:2] - cpu[3][:2])
             < backend_mean_tolerance
         )
-        assert np.allclose(gpu[3][2:], cpu[3][2:], rtol=0.06)
+        assert np.allclose(
+            gpu[3][2:], cpu[3][2:], rtol=0.06, atol=0.0
+        )
         for output in (cpu, gpu):
             assert np.all(
                 np.abs(output[3][:2] - expected_mean) < mean_tolerance
             )
             assert np.allclose(
-                output[3][2:], [sigma**2, sigma**2], rtol=0.08
+                output[3][2:], [sigma**2, sigma**2],
+                rtol=0.08, atol=0.0
             )
 
     # Resetting the seed supplies the same angular realization in the two
@@ -1211,7 +1240,7 @@ def test_cuda_rng_state_persists_and_reseeds_reproducibly():
     # angular samples. Equality here would expose per-step state reset.
     assert np.allclose(
         second_increment.sum(axis=(0, 1)),
-        first_increment.sum(axis=(0, 1)), rtol=2.0e-13
+        first_increment.sum(axis=(0, 1)), rtol=2.0e-13, atol=0.0
     )
     assert not np.array_equal(second_increment, first_increment)
 
@@ -1247,10 +1276,12 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
         dataset = fields["radiation_electrons"]
         assert dataset.shape == (5, 7, 4)
         assert np.allclose(
-            dataset.attrs["gridGlobalOffset"], [-0.12, 0.03, 2.0e-16]
+            dataset.attrs["gridGlobalOffset"], [-0.12, 0.03, 2.0e-16],
+            rtol=2.0e-15, atol=0.0
         )
         assert np.allclose(
-            dataset.attrs["gridSpacing"], [0.05, 0.02, 2.0e-16]
+            dataset.attrs["gridSpacing"], [0.05, 0.02, 2.0e-16],
+            rtol=2.0e-15, atol=0.0
         )
         assert np.array_equal(dataset[:], first)
         assert np.array_equal(
@@ -1264,7 +1295,9 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
 
     timeseries = OpenPMDTimeSeries(str(tmp_path / "hdf5"))
     assert np.array_equal(timeseries.iterations, [3, 6])
-    assert np.allclose(timeseries.t, [3.0e-18, 6.0e-18])
+    assert np.allclose(
+        timeseries.t, [3.0e-18, 6.0e-18], rtol=2.0e-15, atol=0.0
+    )
     loaded_first, info = timeseries.get_field(
         "radiation_electrons", iteration=3, slice_across=None
     )
@@ -1275,11 +1308,18 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
     assert np.array_equal(loaded_second, second)
     assert np.array_equal(loaded_second - loaded_first, increment)
     assert info.axes == {0: "x", 1: "y", 2: "z"}
-    assert np.allclose(info.x, [-0.12, -0.07, -0.02, 0.03, 0.08])
     assert np.allclose(
-        info.y, [0.03, 0.05, 0.07, 0.09, 0.11, 0.13, 0.15]
+        info.x, [-0.12, -0.07, -0.02, 0.03, 0.08],
+        rtol=2.0e-15, atol=0.0
     )
-    assert np.allclose(info.z, [2.0e-16, 4.0e-16, 6.0e-16, 8.0e-16])
+    assert np.allclose(
+        info.y, [0.03, 0.05, 0.07, 0.09, 0.11, 0.13, 0.15],
+        rtol=2.0e-15, atol=0.0
+    )
+    assert np.allclose(
+        info.z, [2.0e-16, 4.0e-16, 6.0e-16, 8.0e-16],
+        rtol=2.0e-15, atol=0.0
+    )
     assert second_info.component_attrs["unitSI"] == 1.0
     assert second_info.component_attrs["gridUnitSI"] == 1.0
     assert second_info.component_attrs["axisLabels"] == ["x", "y", "z"]
@@ -1451,8 +1491,14 @@ def test_mpi_reduction_and_openpmd_output(tmp_path):
         (5.0e-15 - 1.0e-17) / 17.0
     ]
     for attrs in attributes.values():
-        assert np.allclose(attrs["gridGlobalOffset"], expected_origin)
-        assert np.allclose(attrs["gridSpacing"], expected_spacing)
+        assert np.allclose(
+            attrs["gridGlobalOffset"], expected_origin,
+            rtol=2.0e-15, atol=0.0
+        )
+        assert np.allclose(
+            attrs["gridSpacing"], expected_spacing,
+            rtol=2.0e-15, atol=0.0
+        )
         assert list(attrs["axisLabels"]) == [b"x", b"y", b"z"]
 
     x_axis = np.linspace(-0.03, 0.10, 31)
@@ -1467,12 +1513,13 @@ def test_mpi_reduction_and_openpmd_output(tmp_path):
         serial_spectrum = serial.sum(axis=(0, 1))
         distributed_spectrum = distributed.sum(axis=(0, 1))
         assert np.allclose(
-            distributed_spectrum, serial_spectrum, rtol=5.0e-13
+            distributed_spectrum, serial_spectrum, rtol=5.0e-13,
+            atol=5.0e-15 * serial_spectrum.max()
         )
         serial_total = serial.sum() * cell_volume
         distributed_total = distributed.sum() * cell_volume
         assert np.isclose(
-            distributed_total, serial_total, rtol=5.0e-13
+            distributed_total, serial_total, rtol=5.0e-13, atol=0.0
         )
         serial_centroid = np.average(
             energy_axis, weights=serial_spectrum
