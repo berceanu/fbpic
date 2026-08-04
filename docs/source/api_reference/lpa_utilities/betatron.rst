@@ -194,7 +194,9 @@ for a fixed backend, MPI rank count and decomposition, particle ordering,
 and population history.  The CPU and CUDA generators are different, so their
 individual angular samples are not expected to be identical.  CUDA atomic
 accumulation may also vary at floating-point roundoff.  Their distributions
-and integrated spectra are equivalent.
+and integrated spectra are equivalent.  Calling ``set_random_seed`` again
+restarts synchrotron sampling at the next accumulation, including persistent
+CUDA streams.
 
 The existing laboratory-frame implementation can optionally apply a
 classical recoil along the electron direction.  That recoil cannot be

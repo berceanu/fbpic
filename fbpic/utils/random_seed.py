@@ -17,6 +17,12 @@ if cupy_installed:
 
 # Keep synchrotron sampling independent of stochastic particle dynamics.
 _synchrotron_random = random.Random()
+_synchrotron_seed_generation = 0
+
+
+def _get_synchrotron_seed_generation():
+    """Return the generation of the synchrotron sampling seed."""
+    return _synchrotron_seed_generation
 
 
 def set_random_seed( random_seed ):
@@ -31,9 +37,12 @@ def set_random_seed( random_seed ):
     random_seed: int
         The seed of the random number generator.
     """
+    global _synchrotron_seed_generation
+
     # Use a different seed for each MPI rank
     # - Set the independent synchrotron angular-sampling seed
     _synchrotron_random.seed( random_seed + MPI.COMM_WORLD.rank )
+    _synchrotron_seed_generation += 1
     # - Set seed for numpy
     np.random.seed( random_seed + MPI.COMM_WORLD.rank )
     if cupy_installed:

@@ -23,7 +23,8 @@ warnings.simplefilter('ignore', category=IntegrationWarning)
 # Check if CUDA is available, then import CUDA functions
 from fbpic.utils.cuda import cuda_installed
 from fbpic.utils.printing import catch_gpu_memory_error
-from fbpic.utils.random_seed import _synchrotron_random
+from fbpic.utils.random_seed import _synchrotron_random, \
+    _get_synchrotron_seed_generation
 if cuda_installed:
     import cupy
     from fbpic.utils.cuda import cuda_tpb_bpg_1d
@@ -151,6 +152,7 @@ class SynchrotronRadiator(object):
 
         self.rng_states_batch = None
         self.rng_states_size = 0
+        self.rng_seed_generation = _get_synchrotron_seed_generation()
 
     def initialize_S_function( self, x_max, nSamples ):
         """
@@ -199,8 +201,16 @@ class SynchrotronRadiator(object):
                 (N_batch, self.N_omega), self.use_cuda, dtype=np.double
             )
 
-            # Preserve RNG state between timesteps. Reallocate only when a
-            # growing particle population requires additional batch states.
+            # Preserve RNG state between timesteps, but restart the streams
+            # after an explicit call to set_random_seed.
+            seed_generation = _get_synchrotron_seed_generation()
+            if seed_generation != self.rng_seed_generation:
+                self.rng_states_batch = None
+                self.rng_states_size = 0
+                self.rng_seed_generation = seed_generation
+
+            # Reallocate only when a growing particle population requires
+            # additional batch states.
             if N_batch > self.rng_states_size:
                 seed = _get_cuda_rng_seed()
                 self.rng_states_batch = create_xoroshiro128p_states(

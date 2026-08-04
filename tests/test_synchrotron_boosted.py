@@ -1175,8 +1175,8 @@ def test_cuda_cpu_identity_and_boosted_population_parity():
 
 
 @pytest.mark.skipif(not cuda_installed, reason="CUDA hardware is unavailable")
-def test_cuda_rng_state_persists_and_reseeds_reproducibly():
-    """CUDA angle streams persist across steps and replay after reseeding."""
+def test_cuda_rng_state_persists_and_live_reseed_replays():
+    """A live radiator retains CUDA streams and restarts them on reseed."""
     gamma_lab = 100.0
     direction = np.array([0.05, -0.03, 1.0])
     direction /= np.linalg.norm(direction)
@@ -1193,40 +1193,57 @@ def test_cuda_rng_state_persists_and_reseeds_reproducibly():
     theta_x = (-0.01, 0.11, 41)
     theta_y = (-0.09, 0.03, 43)
 
-    def run_two_steps():
-        species = _dummy_species(
-            1.0e-18 / dt_ratio, u_sim, E_sim, cB_sim,
-            count=1024, use_cuda=True
-        )
-        set_random_seed(20260803)
-        radiator = _make_radiator(
-            species, energy, theta_x, theta_y,
-            50.0, boost, 128
-        )
-        assert radiator.rng_states_batch is None
+    species = _dummy_species(
+        1.0e-18 / dt_ratio, u_sim, E_sim, cB_sim,
+        count=1024, use_cuda=True
+    )
+    set_random_seed(20260803)
+    radiator = _make_radiator(
+        species, energy, theta_x, theta_y,
+        50.0, boost, 128
+    )
+    assert radiator.rng_states_batch is None
 
-        radiator.handle_radiation()
-        cupy.cuda.runtime.deviceSynchronize()
-        first_total = _to_numpy(radiator.radiation_data).copy()
-        first_states = radiator.rng_states_batch
-        first_state_size = radiator.rng_states_size
+    radiator.handle_radiation()
+    cupy.cuda.runtime.deviceSynchronize()
+    first_total = _to_numpy(radiator.radiation_data).copy()
+    first_states = radiator.rng_states_batch
+    first_state_size = radiator.rng_states_size
 
-        radiator.handle_radiation()
-        cupy.cuda.runtime.deviceSynchronize()
-        second_total = _to_numpy(radiator.radiation_data).copy()
+    radiator.handle_radiation()
+    cupy.cuda.runtime.deviceSynchronize()
+    second_total = _to_numpy(radiator.radiation_data).copy()
+    first_increment = first_total
+    second_increment = second_total - first_total
 
-        # A fixed population continues the existing xoroshiro streams rather
-        # than allocating and reseeding them at every diagnostic event.
-        assert radiator.rng_states_batch is first_states
-        assert radiator.rng_states_size == first_state_size
-        return first_total, second_total - first_total
+    # A fixed population continues the existing xoroshiro streams rather
+    # than allocating and reseeding them at every diagnostic event.
+    assert radiator.rng_states_batch is first_states
+    assert radiator.rng_states_size == first_state_size
 
-    first_increment, second_increment = run_two_steps()
-    repeated_first, repeated_second = run_two_steps()
+    # Reseeding a live simulation invalidates persistent CUDA streams lazily:
+    # the state object changes at the next radiation event, not before it.
+    set_random_seed(20260803)
+    assert radiator.rng_states_batch is first_states
+    radiator.handle_radiation()
+    cupy.cuda.runtime.deviceSynchronize()
+    third_total = _to_numpy(radiator.radiation_data).copy()
+    repeated_first = third_total - second_total
+    reseeded_states = radiator.rng_states_batch
+    assert reseeded_states is not first_states
+    assert radiator.rng_states_size == first_state_size
+
+    radiator.handle_radiation()
+    cupy.cuda.runtime.deviceSynchronize()
+    fourth_total = _to_numpy(radiator.radiation_data).copy()
+    repeated_second = fourth_total - third_total
+    assert radiator.rng_states_batch is reseeded_states
+    assert radiator.rng_states_size == first_state_size
+
     scale = max(first_increment.max(), second_increment.max())
     assert scale > 0.0
 
-    # Resetting FBPIC's seed reproduces the complete two-step stream history.
+    # Resetting FBPIC's seed replays both increments on the same radiator.
     assert np.allclose(
         repeated_first, first_increment,
         rtol=5.0e-15, atol=5.0e-15 * scale
