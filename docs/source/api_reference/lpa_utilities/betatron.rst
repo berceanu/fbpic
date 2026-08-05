@@ -140,6 +140,16 @@ therefore multiplies each simulation-frame step by this particle-dependent
 factor before accumulating :math:`P\,\mathrm dt`.  This worldline factor is
 required even after momenta and fields have been transformed.
 
+As in the original laboratory-frame diagnostic, the finite-step PIC
+evaluation uses synchronized particle positions and momenta at a half step
+with fields gathered at the preceding integer step.  It also approximates
+the worldline integral with the step-local value of
+:math:`\gamma/\gamma'`.  This staggered finite-step tuple and quadrature are
+not exactly Lorentz covariant.  Laboratory- and boosted-frame PIC results
+therefore agree in the timestep-converged limit rather than being expected
+to match exactly at finite resolution.  Comparisons between frames should
+include a timestep-convergence check.
+
 All radiation formulas above are then evaluated from the reconstructed
 laboratory quantities.  In particular, the cutoff and angular spread use
 the laboratory :math:`\gamma`, and :math:`\omega_c` and the photon-energy
