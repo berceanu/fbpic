@@ -1339,7 +1339,11 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
     )
     assert second_info.component_attrs["unitSI"] == 1.0
     assert second_info.component_attrs["gridUnitSI"] == 1.0
-    assert second_info.component_attrs["axisLabels"] == ["x", "y", "z"]
+    axis_labels = [
+        label.decode() if isinstance(label, (bytes, np.bytes_)) else label
+        for label in second_info.component_attrs["axisLabels"]
+    ]
+    assert axis_labels == ["x", "y", "z"]
 
 
 def _run_mpi_openpmd_worker(write_dir):

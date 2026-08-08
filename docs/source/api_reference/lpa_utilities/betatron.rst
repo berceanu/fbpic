@@ -169,12 +169,17 @@ spectral-angular density
 
 Since radians are dimensionless in SI, :math:`R` is dimensionless (and may
 also be read as per radian squared).  The accumulated energy represented by
-the output grid is
+the output grid is obtained by numerical quadrature.  For example, using
+trapezoidal weights :math:`q_k` on the linearly spaced photon-energy axis,
 
 .. math::
 
-    E_{\mathrm{grid}} = \sum_{i,j,k} R_{ijk}\,
-    \Delta\theta_x\,\Delta\theta_y\,\Delta(\hbar\omega).
+    E_{\mathrm{grid}} \simeq \sum_{i,j,k} q_k R_{ijk}\,
+    \Delta\theta_x\,\Delta\theta_y\,\Delta(\hbar\omega),
+
+where the endpoint weights are one half.  The angular sum is histogram-like,
+whereas the energy dependence is sampled at grid points; downstream analysis
+should therefore state its energy-quadrature convention.
 
 This normalization is unchanged between laboratory and boosted simulations.
 MPI ranks are summed before the standard openPMD output is written.  The
