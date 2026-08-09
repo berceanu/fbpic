@@ -1,0 +1,12 @@
+# Reproducible single-process H100 FBPIC + SynchRad environment.
+# Compile from this directory with:
+#   uv pip compile requirements-h100.in -o requirements-h100.lock --python-version 3.12 --python-platform linux
+
+-e .
+-e ../synchrad
+picnostics @ git+ssh://git@github.com/berceanu/picnostics.git@47b7057247ed354f75b8090f3725d116fec534d6
+
+cupy-cuda12x
+numba==0.65.0
+pyfftw
+openpmd-api
