@@ -104,45 +104,64 @@ class SynchrotronRadiator(object):
         self.gamma_cutoff_inv = 1. / gamma_cutoff
         self.radiation_reaction = radiation_reaction
 
-        self.omega_min = photon_energy_axis[0] / hbar
-        self.omega_max = photon_energy_axis[1] / hbar
-        self.N_omega = photon_energy_axis[2]
+        axes = (photon_energy_axis, theta_x_axis, theta_y_axis)
+        if any(axis is None for axis in axes) and not all(
+                axis is None for axis in axes):
+            raise ValueError(
+                "Legacy synchrotron activation requires all three axes; "
+                "omit all three when an observer-frame diagnostic will "
+                "configure the requested products.")
+        self.legacy_enabled = all(axis is not None for axis in axes)
+        if not self.legacy_enabled and radiation_reaction:
+            raise ValueError(
+                "Radiation reaction requires the legacy three-axis "
+                "synchrotron activation; observer-frame products are passive.")
+        self.observer_accumulator = None
+        if self.legacy_enabled:
+            self.omega_min = photon_energy_axis[0] / hbar
+            self.omega_max = photon_energy_axis[1] / hbar
+            self.N_omega = photon_energy_axis[2]
 
-        self.theta_x_min = theta_x_axis[0]
-        self.theta_x_max = theta_x_axis[1]
-        self.N_theta_x = theta_x_axis[2]
+            self.theta_x_min = theta_x_axis[0]
+            self.theta_x_max = theta_x_axis[1]
+            self.N_theta_x = theta_x_axis[2]
 
-        self.theta_y_min = theta_y_axis[0]
-        self.theta_y_max = theta_y_axis[1]
-        self.N_theta_y = theta_y_axis[2]
+            self.theta_y_min = theta_y_axis[0]
+            self.theta_y_max = theta_y_axis[1]
+            self.N_theta_y = theta_y_axis[2]
 
-        # Create the photon frequency axis
-        self.omega_ax = np.linspace(
-            self.omega_min, self.omega_max, self.N_omega
-        )
-        self.d_omega = self.omega_ax[1] - self.omega_ax[0]
-
-        # Create the angular axes
-        self.d_theta_x = (self.theta_x_max - self.theta_x_min) \
-            / (self.N_theta_x - 1)
-        self.d_theta_y = (self.theta_y_max - self.theta_y_min) \
-            / (self.N_theta_y - 1)
-
-        self.Larmore_factor_density = e**2 * self.dt \
-            / ( 6 * np.pi * epsilon_0 * c * hbar * \
-                self.d_theta_x * self.d_theta_y )
-
-        self.Larmore_factor_momentum = e**2 * self.dt \
-            / ( 6 * np.pi * epsilon_0 * m_e * c**3 )
+            self.omega_ax = np.linspace(
+                self.omega_min, self.omega_max, self.N_omega)
+            self.d_omega = self.omega_ax[1] - self.omega_ax[0]
+            self.d_theta_x = (self.theta_x_max - self.theta_x_min) \
+                / (self.N_theta_x - 1)
+            self.d_theta_y = (self.theta_y_max - self.theta_y_min) \
+                / (self.N_theta_y - 1)
+            self.Larmore_factor_density = e**2 * self.dt \
+                / (6 * np.pi * epsilon_0 * c * hbar
+                   * self.d_theta_x * self.d_theta_y)
+            self.Larmore_factor_momentum = e**2 * self.dt \
+                / (6 * np.pi * epsilon_0 * m_e * c**3)
+        else:
+            self.omega_min = self.omega_max = self.d_omega = None
+            self.theta_x_min = self.theta_x_max = self.d_theta_x = None
+            self.theta_y_min = self.theta_y_max = self.d_theta_y = None
+            self.N_omega = self.N_theta_x = self.N_theta_y = 0
+            self.omega_ax = None
+            self.Larmore_factor_density = None
+            self.Larmore_factor_momentum = (
+                e**2 * self.dt / (6 * np.pi * epsilon_0 * m_e * c**3))
 
         # Calculate sampling of the spectral profile function
         self.initialize_S_function( x_max=x_max, nSamples=nSamples )
 
         # Initialize radiation data
-        self.radiation_data = np.zeros(
-            (self.N_theta_x, self.N_theta_y, self.N_omega),
-            dtype=np.double
-        )
+        if self.legacy_enabled:
+            self.radiation_data = np.zeros(
+                (self.N_theta_x, self.N_theta_y, self.N_omega),
+                dtype=np.double)
+        else:
+            self.radiation_data = None
 
         # send the radiation-relevant data to GPU
         self.send_to_gpu()
@@ -178,9 +197,39 @@ class SynchrotronRadiator(object):
         self.S_func_data[0] = 0.0
         self.S_func_data[1:] = S0(x_ax[1:])
         self.S_func_dx = x_ax[1] - x_ax[0]
+        self.S_func_x = x_ax
+        self.S_cdf_data = np.zeros_like(x_ax)
+        self.S_cdf_data[1:] = np.cumsum(
+            0.5 * (self.S_func_data[:-1] + self.S_func_data[1:])
+            * self.S_func_dx)
+        self.S_cdf_data /= self.S_cdf_data[-1]
+
+    def configure_observer_diagnostic(self, **configuration):
+        """Configure the fast observer-frame products for this species."""
+        if self.radiation_reaction:
+            raise NotImplementedError(
+                "Observer-frame radiation products are passive and cannot "
+                "be combined with radiation reaction.")
+        if self.observer_accumulator is not None:
+            raise RuntimeError(
+                "Only one observer-frame synchrotron diagnostic may configure "
+                "a species at a time.")
+        from .observer import ObserverFrameRadiationAccumulator
+        configuration.setdefault("gamma_boost", self.gamma_boost)
+        configuration.setdefault("beta_boost", self.beta_boost)
+        spectral_x = self.S_func_x
+        spectral_cdf = self.S_cdf_data
+        self.observer_accumulator = ObserverFrameRadiationAccumulator(
+            self.eon, self.dt, spectral_x, spectral_cdf, **configuration)
+        # Do not pay for or double-count the legacy N_energy loop when the new
+        # independently selectable products are active.
+        self.legacy_enabled = False
+        if self.use_cuda:
+            self.observer_accumulator.send_to_gpu()
+        return self.observer_accumulator
 
     @catch_gpu_memory_error
-    def handle_radiation( self ):
+    def handle_radiation( self, simulation_time=0.0 ):
         """
         Handle radiation, either on CPU or GPU
         """
@@ -189,6 +238,11 @@ class SynchrotronRadiator(object):
 
         # Skip this function if there are no electrons
         if eon.Ntot == 0:
+            return
+
+        if self.observer_accumulator is not None:
+            self.observer_accumulator.accumulate(simulation_time)
+        if not self.legacy_enabled:
             return
 
         if self.use_cuda:
@@ -268,15 +322,24 @@ class SynchrotronRadiator(object):
         Copy relevant data to the GPU
         """
         if self.use_cuda:
-            self.radiation_data = cupy.asarray( self.radiation_data )
-            self.omega_ax = cupy.asarray( self.omega_ax )
+            if self.radiation_data is not None:
+                self.radiation_data = cupy.asarray( self.radiation_data )
+            if self.omega_ax is not None:
+                self.omega_ax = cupy.asarray( self.omega_ax )
             self.S_func_data = cupy.asarray( self.S_func_data )
+            if self.observer_accumulator is not None:
+                self.observer_accumulator.send_to_gpu()
 
     def receive_from_gpu( self ):
         """
         Receive relevant data from the GPU
         """
         if self.use_cuda:
-            self.radiation_data = self.radiation_data.get()
-            self.omega_ax = self.omega_ax.get()
-            self.S_func_data = self.S_func_data.get()
+            if hasattr(self.radiation_data, 'get'):
+                self.radiation_data = self.radiation_data.get()
+            if hasattr(self.omega_ax, 'get'):
+                self.omega_ax = self.omega_ax.get()
+            if hasattr(self.S_func_data, 'get'):
+                self.S_func_data = self.S_func_data.get()
+            if self.observer_accumulator is not None:
+                self.observer_accumulator.receive_from_gpu()

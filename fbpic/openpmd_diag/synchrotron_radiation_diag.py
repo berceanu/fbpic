@@ -8,6 +8,7 @@ import os
 import numpy as np
 from scipy.constants import hbar
 from .generic_diag import OpenPMDDiagnostic
+from .observer_radiation_diag import ObserverRadiationWriter
 from fbpic.utils.mpi import comm as comm_simple
 
 class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
@@ -15,8 +16,26 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
     Class that defines the synchrotron radiation diagnostics to be performed.
     """
 
-    def __init__(self, period=None, dt_period=None, species={}, comm=None,
-                 write_dir=None,iteration_min=0, iteration_max=np.inf ):
+    def __init__(
+            self, period=None, dt_period=None, species=None, comm=None,
+            write_dir=None, iteration_min=0, iteration_max=np.inf,
+            observer_frame=None, boost=None, observer_translation=None,
+            photon_energy_bin_edges=None, photon_energy_edges=None,
+            angular_measure="solid_angle", angular_bin_edges=None,
+            theta_x_bin_edges=None, theta_y_bin_edges=None,
+            theta_x_edges=None, theta_y_edges=None,
+            detectors=None, detector_directions=None,
+            detector_apertures=None, observer_time_bin_edges=None,
+            observer_time_edges=None, source_coordinate_bin_edges=None,
+            source_coordinate_edges=None,
+            source_distribution_projections=None, source_projections=None,
+            source_moment_selections=None, source_moments=None,
+            output_channels=None, channels=None, cumulative=True,
+            interval=False, output_mode=None,
+            local_angular_model="synchrotron", samples_per_particle=1,
+            particle_batch_size=262144,
+            particle_selection=None, gamma_threshold=None,
+            gamma_cutoff=None):
         """
         Initialize the synchrotron radiation diagnostic
 
@@ -52,7 +71,84 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         iteration_min, iteration_max: ints, optional
             The iterations between which data should be written
             (`iteration_min` is inclusive, `iteration_max` is exclusive)
+
+        observer_frame: {'laboratory', 'simulation'}, optional
+            Frame in which every advanced radiation observable is defined.
+            Passing any observer-frame product option selects the advanced
+            interface; omitting all of them preserves the legacy writer.
+
+        boost: a BoostConverter, optional
+            Lorentz transform from the simulation frame to the laboratory
+            observer frame.  If omitted, the transform supplied when the
+            species was activated is used.
+
+        observer_translation: array-like of four floats, optional
+            Translation ``(ct, x, y, z)`` applied after the Lorentz transform.
+
+        photon_energy_bin_edges: array-like, optional
+            Observer-frame photon-energy bin edges in joules.
+
+        angular_bin_edges: pair or dict, optional
+            Observer-frame ``theta_x`` and ``theta_y`` bin edges.  A dict uses
+            the keys ``theta_x`` and ``theta_y``.
+
+        angular_measure: {'solid_angle', 'projected_angles'}, optional
+            Whether angular-spectral densities are per ``dOmega`` or per
+            ``dtheta_x dtheta_y``.
+
+        detectors: sequence of dicts, optional
+            Far-field channels.  Each dict contains a three-vector
+            ``direction`` (or ``theta_x`` and ``theta_y``), optional circular
+            ``half_angle``, ``aperture_quadrature``, ``energy_bands``, and
+            per-detector time edges or pulse interval.
+
+        observer_time_bin_edges: array-like, optional
+            Default edges for ``t - n.r/c`` profiles, in seconds.
+
+        source_coordinate_bin_edges: dict, optional
+            Observer-frame edges for any of ``x``, ``y``, and ``z``.
+
+        source_distribution_projections: sequence, optional
+            Named dicts or axis tuples selected from ``x``, ``y``, ``z``,
+            ``theta_x``, ``theta_y``, ``energy``, and ``time``.  ``'full'``
+            selects all axes whose edges are available.
+
+        source_moment_selections: sequence of dicts, optional
+            Energy, angle, coordinate, direction, and observer-time regions
+            for radiation-weighted source moments.
+
+        output_channels: sequence or dict, optional
+            Independently enable ``angular_spectral``, ``observer_time``,
+            ``source``, ``source_moments``, and ``accounting``.  When omitted,
+            channels are inferred from the supplied configurations.
+
+        cumulative, interval: bool, optional
+            Select cumulative and/or per-output-interval records.  The
+            equivalent ``output_mode`` values are ``cumulative``, ``interval``,
+            and ``both``.
+
+        local_angular_model: {'synchrotron', 'legacy_gaussian'}, optional
+            Local spectral-angular closure.  The default uses the local orbit
+            plane and a photon-energy-dependent Schwinger angular kernel.
+
+        samples_per_particle: int, optional
+            Fixed number of stratified local spectral-angular samples per
+            emitting particle and step.  It does not depend on output bins.
+
+        particle_batch_size: int, optional
+            Maximum particles processed together.  This bounds temporary
+            CPU/GPU memory independently of the total population.
+
+        particle_selection: dict, optional
+            Observer-frame ranges for particle position, momentum, angle,
+            weight, or Lorentz factor.
+
+        gamma_threshold, gamma_cutoff: float, optional
+            Observer-frame Lorentz-factor threshold.  ``gamma_threshold`` is
+            the preferred diagnostic spelling; ``gamma_cutoff`` is an alias.
         """
+        if species is None:
+            species = {}
         # Check input
         if len(species) == 0:
             raise ValueError(
@@ -67,10 +163,196 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
                 raise ValueError(
                     f"{species_name} must have synchrotron radiation active")
 
-        sr_object = species[ self.species_names[0] ].synchrotron_radiator
+        radiators = {
+            name: species[name].synchrotron_radiator
+            for name in self.species_names
+        }
+        sr_object = radiators[self.species_names[0]]
 
         self.use_cuda = sr_object.use_cuda
         self.dt_sim = sr_object.dt
+        for species_name, radiator in radiators.items():
+            if radiator.use_cuda != self.use_cuda:
+                raise ValueError(
+                    "All synchrotron species in one diagnostic must use the "
+                    "same CPU/GPU backend.")
+            if not np.isclose(
+                    radiator.dt, self.dt_sim, rtol=2.e-14, atol=0.0):
+                raise ValueError(
+                    "All synchrotron species in one diagnostic must have the "
+                    "same timestep.")
+        self.advanced = any(value is not None for value in (
+            observer_frame, boost, observer_translation,
+            photon_energy_bin_edges, photon_energy_edges,
+            angular_bin_edges, theta_x_bin_edges, theta_y_bin_edges,
+            theta_x_edges, theta_y_edges, detectors, detector_directions,
+            detector_apertures, observer_time_bin_edges, observer_time_edges,
+            source_coordinate_bin_edges, source_coordinate_edges,
+            source_distribution_projections, source_projections,
+            source_moment_selections, source_moments,
+            output_channels, channels, gamma_threshold, gamma_cutoff,
+            particle_selection,
+        )) or output_mode is not None or interval or not cumulative \
+            or particle_batch_size != 262144 \
+            or angular_measure != "solid_angle" \
+            or local_angular_model != "synchrotron" \
+            or samples_per_particle != 1 \
+            or any(not getattr(radiator, "legacy_enabled", True)
+                   for radiator in radiators.values())
+
+        if self.advanced:
+            aliases = (
+                ("photon_energy_bin_edges", photon_energy_bin_edges,
+                 "photon_energy_edges", photon_energy_edges),
+                ("theta_x_bin_edges", theta_x_bin_edges,
+                 "theta_x_edges", theta_x_edges),
+                ("theta_y_bin_edges", theta_y_bin_edges,
+                 "theta_y_edges", theta_y_edges),
+                ("observer_time_bin_edges", observer_time_bin_edges,
+                 "observer_time_edges", observer_time_edges),
+                ("source_coordinate_bin_edges", source_coordinate_bin_edges,
+                 "source_coordinate_edges", source_coordinate_edges),
+                ("source_distribution_projections",
+                 source_distribution_projections,
+                 "source_projections", source_projections),
+                ("source_moment_selections", source_moment_selections,
+                 "source_moments", source_moments),
+                ("output_channels", output_channels, "channels", channels),
+                ("gamma_threshold", gamma_threshold,
+                 "gamma_cutoff", gamma_cutoff),
+            )
+            for first_name, first_value, second_name, second_value in aliases:
+                if first_value is not None and second_value is not None:
+                    raise ValueError(
+                        "Specify only one of `%s` and `%s`." %
+                        (first_name, second_name))
+            energy_edges = (
+                photon_energy_bin_edges if photon_energy_bin_edges is not None
+                else photon_energy_edges)
+            x_edges = (theta_x_bin_edges if theta_x_bin_edges is not None
+                       else theta_x_edges)
+            y_edges = (theta_y_bin_edges if theta_y_bin_edges is not None
+                       else theta_y_edges)
+            if angular_bin_edges is not None:
+                if x_edges is not None or y_edges is not None:
+                    raise ValueError(
+                        "Use either `angular_bin_edges` or separate theta "
+                        "edge arguments, not both.")
+                if isinstance(angular_bin_edges, dict):
+                    x_edges = angular_bin_edges.get(
+                        "theta_x", angular_bin_edges.get("x"))
+                    y_edges = angular_bin_edges.get(
+                        "theta_y", angular_bin_edges.get("y"))
+                else:
+                    x_edges, y_edges = angular_bin_edges
+
+            time_edges = (
+                observer_time_bin_edges
+                if observer_time_bin_edges is not None
+                else observer_time_edges)
+            coordinate_edges = (
+                source_coordinate_bin_edges
+                if source_coordinate_bin_edges is not None
+                else source_coordinate_edges)
+            projections = (
+                source_distribution_projections
+                if source_distribution_projections is not None
+                else source_projections)
+            moments = (
+                source_moment_selections
+                if source_moment_selections is not None else source_moments)
+            requested_channels = (
+                output_channels if output_channels is not None else channels)
+            if isinstance(requested_channels, dict):
+                requested_channels = [
+                    name for name, enabled in requested_channels.items()
+                    if enabled]
+
+            detector_config = self._combine_detector_configuration(
+                detectors, detector_directions, detector_apertures)
+            if observer_frame is None:
+                observer_frame = "laboratory"
+            if output_mode is None:
+                if cumulative and interval:
+                    output_mode = "both"
+                elif interval:
+                    output_mode = "interval"
+                elif cumulative:
+                    output_mode = "cumulative"
+                else:
+                    raise ValueError(
+                        "At least one of cumulative or interval output is "
+                        "required.")
+            if output_mode not in ("cumulative", "interval", "both"):
+                raise ValueError(
+                    "`output_mode` must be cumulative, interval, or both.")
+
+            if observer_frame != "simulation" and boost is None:
+                first_transform = (
+                    sr_object.gamma_boost, sr_object.beta_boost)
+                for species_name, radiator in radiators.items():
+                    transform = (radiator.gamma_boost, radiator.beta_boost)
+                    if not np.allclose(
+                            transform, first_transform, rtol=2.e-14,
+                            atol=2.e-15):
+                        raise ValueError(
+                            "All species must use the same inferred observer "
+                            "boost; pass an explicit `boost` otherwise.")
+            for species_name, radiator in radiators.items():
+                if radiator.radiation_reaction:
+                    raise NotImplementedError(
+                        "Observer-frame radiation products are passive and "
+                        "cannot be combined with radiation reaction.")
+                if radiator.observer_accumulator is not None:
+                    raise RuntimeError(
+                        "Only one observer-frame synchrotron diagnostic may "
+                        "configure species `%s`." % species_name)
+
+            explicit_gamma = (
+                gamma_threshold if gamma_threshold is not None else gamma_cutoff)
+            boost_gamma = None if boost is None else boost.gamma0
+            boost_beta = None if boost is None else boost.beta0
+            self.accumulators = {}
+            for species_name in self.species_names:
+                radiator = radiators[species_name]
+                configuration = {
+                    "observer_frame": observer_frame,
+                    "observer_translation": observer_translation,
+                    "enabled_channels": requested_channels,
+                    "photon_energy_edges": energy_edges,
+                    "theta_x_edges": x_edges,
+                    "theta_y_edges": y_edges,
+                    "angular_measure": angular_measure,
+                    "detectors": detector_config,
+                    "observer_time_edges": time_edges,
+                    "source_coordinate_edges": coordinate_edges,
+                    "source_projections": projections,
+                    "source_moments": moments,
+                    "local_angular_model": local_angular_model,
+                    "samples_per_particle": samples_per_particle,
+                    "particle_batch_size": particle_batch_size,
+                    "particle_selection": particle_selection,
+                    "gamma_cutoff": (
+                        explicit_gamma if explicit_gamma is not None
+                        else 1.0 / radiator.gamma_cutoff_inv),
+                }
+                if boost_gamma is not None:
+                    configuration["gamma_boost"] = boost_gamma
+                    configuration["beta_boost"] = boost_beta
+                self.accumulators[species_name] = \
+                    radiator.configure_observer_diagnostic(**configuration)
+
+            OpenPMDDiagnostic.__init__(
+                self, period, comm, write_dir, iteration_min, iteration_max,
+                dt_period=dt_period, dt_sim=self.dt_sim)
+            self.observer_writer = ObserverRadiationWriter(self, output_mode)
+            return
+
+        if not getattr(sr_object, "legacy_enabled", True):
+            raise ValueError(
+                "This species was activated without legacy axes. Configure "
+                "observer-frame output channels and bin edges on the "
+                "SynchrotronRadiationDiagnostic.")
         self.mesh_shape = (
             sr_object.N_theta_x, sr_object.N_theta_y, sr_object.N_omega
         )
@@ -90,6 +372,56 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
                             iteration_min, iteration_max,
                             dt_period=dt_period, dt_sim=self.dt_sim )
 
+    @staticmethod
+    def _combine_detector_configuration(
+            detectors, detector_directions, detector_apertures):
+        if detectors is None:
+            combined = []
+        elif isinstance(detectors, dict):
+            combined = [dict(detectors)]
+        else:
+            combined = list(detectors)
+        if detector_directions is not None:
+            directions = detector_directions
+            array = np.asarray(directions)
+            if array.shape == (3,):
+                directions = [directions]
+            for index, direction in enumerate(directions):
+                if isinstance(direction, dict):
+                    item = dict(direction)
+                else:
+                    item = {
+                        "name": "direction_%d" % index,
+                        "direction": direction,
+                    }
+                combined.append(item)
+        if detector_apertures is not None:
+            apertures = detector_apertures
+            if isinstance(apertures, dict):
+                apertures = [apertures]
+            elif np.isscalar(apertures):
+                if not combined:
+                    raise ValueError(
+                        "A scalar detector aperture requires at least one "
+                        "detector direction.")
+                apertures = [apertures] * len(combined)
+            if all(isinstance(item, dict) for item in apertures):
+                for item in apertures:
+                    combined.append(dict(item))
+            else:
+                if len(apertures) != len(combined):
+                    raise ValueError(
+                        "Scalar detector aperture values must match the "
+                        "number of configured directions.")
+                updated = []
+                for detector, aperture in zip(combined, apertures):
+                    item = (dict(detector) if isinstance(detector, dict)
+                            else {"direction": detector})
+                    item["half_angle"] = aperture
+                    updated.append(item)
+                combined = updated
+        return combined
+
 
     def write_hdf5( self, iteration ):
         """
@@ -100,6 +432,10 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         iteration : int
              The current iteration number of the simulation.
         """
+
+        if self.advanced:
+            self.observer_writer.write(iteration)
+            return
 
         # If needed: Receive data from the GPU
         if self.use_cuda :

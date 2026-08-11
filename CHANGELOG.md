@@ -1,5 +1,15 @@
 # Change Log / Release Log for fbpic
 
+## Unreleased
+
+- Add a fast, passive observer-frame betatron synchrotron-radiation
+  diagnostic with independent angular-spectral, observer-time, source,
+  source-moment, and energy-accounting channels on CPU, GPU, and MPI.
+- Reconstruct boosted emission position, time, momentum, fields, and the
+  particle worldline interval in one observer frame; keep longitudinal power
+  separate from the curvature spectrum.
+- Preserve the original three-axis synchrotron histogram as a legacy API.
+
 ## 0.26.0
 
 ### What's Changed

@@ -456,8 +456,8 @@ class Particles(object) :
             laser_waist, laser_ctau, laser_initial_z0,
             ratio_w_electron_photon, boost )
 
-    def activate_synchrotron( self, photon_energy_axis, theta_x_axis,
-                              theta_y_axis, gamma_cutoff=10.0,
+    def activate_synchrotron( self, photon_energy_axis=None, theta_x_axis=None,
+                              theta_y_axis=None, gamma_cutoff=10.0,
                               radiation_reaction=False, x_max=20,
                               nSamples=2048, boost=None ):
         """
@@ -470,6 +470,10 @@ class Particles(object) :
             `(photon_energy_min, photon_energy_max, N_photon_energy)`, where
             `photon_energy_min` and `photon_energy_max` are floats in Joules
             and `N_photon_energy` is integer
+            Omit this and both angular axes when the requested bin edges and
+            output channels will be configured by
+            :class:`SynchrotronRadiationDiagnostic`.  This avoids allocating
+            the legacy maximal three-dimensional histogram.
 
         theta_x_axis: tuple
             Parameters for the x-elevation angle axis provided as
@@ -650,7 +654,7 @@ class Particles(object) :
             self.ionizer.handle_ionization( self )
         # Synchrotron radiation
         if self.synchrotron_radiator is not None:
-            self.synchrotron_radiator.handle_radiation()
+            self.synchrotron_radiator.handle_radiation(t)
         # Compton scattering
         if self.compton_scatterer is not None:
             self.compton_scatterer.handle_scattering( self, t )
