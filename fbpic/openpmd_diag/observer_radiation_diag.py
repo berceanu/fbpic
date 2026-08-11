@@ -27,23 +27,16 @@ def _clean(value):
     return str(value).replace("/", "_").replace("-", "_")
 
 
+_ADDITIVE_SNAPSHOT_CATEGORIES = ("data", "accounting", "sampling")
+
+
 def _subtract_snapshot(current, previous):
     return {
         category: {
             key: current[category][key] - previous[category][key]
             for key in current[category]
         }
-        for category in ("data", "accounting", "moments")
-    }
-
-
-def _zero_snapshot_like(snapshot):
-    return {
-        category: {
-            key: np.zeros_like(value)
-            for key, value in snapshot[category].items()
-        }
-        for category in ("data", "accounting", "moments")
+        for category in _ADDITIVE_SNAPSHOT_CATEGORIES
     }
 
 
@@ -104,9 +97,12 @@ def _moment_component_selected(name, quantities):
     if name == "energy":
         return True
     if "observer_time" in name:
-        needs_position = name.startswith(("covariance_", "correlation_"))
-        return "time" in quantities and (
-            not needs_position or "position" in quantities)
+        if name.startswith(("covariance_", "correlation_")):
+            paired_quantity = (
+                "angle" if "theta_" in name else "position")
+            return (
+                "time" in quantities and paired_quantity in quantities)
+        return "time" in quantities
     if "theta_" in name:
         needs_position = name.startswith((
             "covariance_x_", "covariance_y_", "covariance_z_",
@@ -155,10 +151,65 @@ def _source_moment_dimensions(quantities=("position", "angle", "time")):
             _LENGTH_DIMENSION + _TIME_DIMENSION
         dimensions["correlation_%s_observer_time" % position_axis] = \
             _DIMENSIONLESS
+    for angle_axis in ("theta_x", "theta_y"):
+        dimensions["covariance_%s_observer_time" % angle_axis] = \
+            _TIME_DIMENSION
+        dimensions["correlation_%s_observer_time" % angle_axis] = \
+            _DIMENSIONLESS
     return {
         name: dimension for name, dimension in dimensions.items()
         if _moment_component_selected(name, quantities)
     }
+
+
+_SOURCE_VARIABLE_COUNT = 6
+_SOURCE_REFERENCED_STAT_SIZE = 34
+_SOURCE_CENTRAL_STAT_SIZE = 28
+
+
+def _packed_upper_index(first, second, count=_SOURCE_VARIABLE_COUNT):
+    if second < first:
+        first, second = second, first
+    return first * count - first * (first - 1) // 2 + second - first
+
+
+def merge_source_moment_stats(first, second):
+    """Merge two referenced centered states without raw cancellation."""
+    first = np.asarray(first, dtype=np.float64)
+    second = np.asarray(second, dtype=np.float64)
+    if (first.size != _SOURCE_REFERENCED_STAT_SIZE
+            or second.size != _SOURCE_REFERENCED_STAT_SIZE):
+        raise ValueError(
+            "Referenced source-moment states must have 34 values.")
+    if first[0] <= 0.0:
+        return second.copy()
+    if second[0] <= 0.0:
+        return first.copy()
+    output = first.copy()
+    first_weight, second_weight = first[0], second[0]
+    total_weight = first_weight + second_weight
+    reference_offset = 1
+    mean_offset = 1 + _SOURCE_VARIABLE_COUNT
+    m2_offset = 1 + 2 * _SOURCE_VARIABLE_COUNT
+    first_reference = first[reference_offset:mean_offset]
+    second_reference = second[reference_offset:mean_offset]
+    first_offset = first[mean_offset:m2_offset]
+    second_offset = second[mean_offset:m2_offset]
+    delta = (
+        (second_reference - first_reference)
+        + (second_offset - first_offset))
+    output[0] = total_weight
+    output[reference_offset:mean_offset] = first_reference
+    output[mean_offset:m2_offset] = (
+        first_offset + delta * second_weight / total_weight)
+    merge_scale = first_weight * second_weight / total_weight
+    for first_index in range(_SOURCE_VARIABLE_COUNT):
+        for second_index in range(first_index, _SOURCE_VARIABLE_COUNT):
+            packed = _packed_upper_index(first_index, second_index)
+            output[m2_offset + packed] = (
+                first[m2_offset + packed] + second[m2_offset + packed]
+                + delta[first_index] * delta[second_index] * merge_scale)
+    return output
 
 
 def source_moment_components(
@@ -175,29 +226,89 @@ def source_moment_components(
         empty["energy"] = energy_item
         return empty
 
-    mean_x = stats[1:4] / weight
-    second_x = stats[4:13].reshape(3, 3) / weight
-    covariance_x = 0.5 * (
-        second_x + second_x.T) - np.outer(mean_x, mean_x)
+    if stats.size == _SOURCE_REFERENCED_STAT_SIZE:
+        reference_offset = 1
+        mean_offset = 1 + _SOURCE_VARIABLE_COUNT
+        m2_offset = 1 + 2 * _SOURCE_VARIABLE_COUNT
+        means = (
+            stats[reference_offset:mean_offset]
+            + stats[mean_offset:m2_offset])
+        covariance = np.zeros((6, 6), dtype=np.float64)
+        offset = m2_offset
+        for first_index in range(_SOURCE_VARIABLE_COUNT):
+            for second_index in range(
+                    first_index, _SOURCE_VARIABLE_COUNT):
+                value = stats[
+                    offset + _packed_upper_index(
+                        first_index, second_index)] / weight
+                covariance[first_index, second_index] = value
+                covariance[second_index, first_index] = value
+        covariance[np.diag_indices(6)] = np.maximum(
+            covariance.diagonal(), 0.0)
+        mean_x = means[:3]
+        covariance_x = covariance[:3, :3]
+        mean_angle = means[3:5]
+        covariance_angle = covariance[3:5, 3:5]
+        covariance_x_angle = covariance[:3, 3:5]
+        mean_time = means[5]
+        variance_time = covariance[5, 5]
+        covariance_x_time = covariance[:3, 5]
+        covariance_angle_time = covariance[3:5, 5]
+    elif stats.size == _SOURCE_CENTRAL_STAT_SIZE:
+        means = stats[1:7]
+        covariance = np.zeros((6, 6), dtype=np.float64)
+        offset = 1 + _SOURCE_VARIABLE_COUNT
+        for first_index in range(_SOURCE_VARIABLE_COUNT):
+            for second_index in range(
+                    first_index, _SOURCE_VARIABLE_COUNT):
+                value = stats[
+                    offset + _packed_upper_index(
+                        first_index, second_index)] / weight
+                covariance[first_index, second_index] = value
+                covariance[second_index, first_index] = value
+        covariance[np.diag_indices(6)] = np.maximum(
+            covariance.diagonal(), 0.0)
+        mean_x = means[:3]
+        covariance_x = covariance[:3, :3]
+        mean_angle = means[3:5]
+        covariance_angle = covariance[3:5, 3:5]
+        covariance_x_angle = covariance[:3, 3:5]
+        mean_time = means[5]
+        variance_time = covariance[5, 5]
+        covariance_x_time = covariance[:3, 5]
+        covariance_angle_time = covariance[3:5, 5]
+    elif stats.size == 30:
+        # Read legacy additive raw sums for compatibility with old files and
+        # callers, but all new accumulation uses the centered state above.
+        mean_x = stats[1:4] / weight
+        second_x = stats[4:13].reshape(3, 3) / weight
+        covariance_x = 0.5 * (
+            second_x + second_x.T) - np.outer(mean_x, mean_x)
+        mean_angle = stats[13:15] / weight
+        second_angle = stats[15:19].reshape(2, 2) / weight
+        covariance_angle = 0.5 * (
+            second_angle + second_angle.T) - np.outer(
+                mean_angle, mean_angle)
+        covariance_x_angle = (
+            stats[19:25].reshape(3, 2) / weight
+            - np.outer(mean_x, mean_angle))
+        mean_time = stats[25] / weight
+        variance_time = max(
+            stats[26] / weight - mean_time**2, 0.0)
+        covariance_x_time = (
+            stats[27:30] / weight - mean_x * mean_time)
+        # The legacy raw layout did not retain angle-time cross terms.
+        covariance_angle_time = np.full(2, np.nan)
+    else:
+        raise ValueError("Unknown source-moment state layout.")
+
     covariance_x[np.diag_indices(3)] = np.maximum(
         covariance_x.diagonal(), 0.0)
-    rms_x = np.sqrt(covariance_x.diagonal())
-
-    mean_angle = stats[13:15] / weight
-    second_angle = stats[15:19].reshape(2, 2) / weight
-    covariance_angle = 0.5 * (
-        second_angle + second_angle.T) - np.outer(mean_angle, mean_angle)
     covariance_angle[np.diag_indices(2)] = np.maximum(
         covariance_angle.diagonal(), 0.0)
+    rms_x = np.sqrt(covariance_x.diagonal())
     rms_angle = np.sqrt(covariance_angle.diagonal())
-
-    covariance_x_angle = (
-        stats[19:25].reshape(3, 2) / weight
-        - np.outer(mean_x, mean_angle))
-    mean_time = stats[25] / weight
-    variance_time = max(stats[26] / weight - mean_time**2, 0.0)
-    rms_time = math.sqrt(variance_time)
-    covariance_x_time = stats[27:30] / weight - mean_x * mean_time
+    rms_time = math.sqrt(max(variance_time, 0.0))
 
     transverse_values, transverse_vectors = np.linalg.eigh(
         covariance_x[:2, :2])
@@ -268,6 +379,15 @@ def source_moment_components(
             float(covariance_x_time[i]), _LENGTH_DIMENSION + _TIME_DIMENSION)
         output["correlation_%s_observer_time" % axis] = (
             float(correlation), _DIMENSIONLESS)
+    for index, axis in enumerate(("theta_x", "theta_y")):
+        denominator = rms_angle[index] * rms_time
+        correlation = (
+            covariance_angle_time[index] / denominator
+            if denominator > 0.0 else 0.0)
+        output["covariance_%s_observer_time" % axis] = (
+            float(covariance_angle_time[index]), _TIME_DIMENSION)
+        output["correlation_%s_observer_time" % axis] = (
+            float(correlation), _DIMENSIONLESS)
     return {
         name: value for name, value in output.items()
         if _moment_component_selected(name, quantities)
@@ -316,39 +436,140 @@ class ObserverRadiationWriter(object):
         self.diagnostic = diagnostic
         self.output_mode = output_mode
         self.previous = {}
+        self.pending_previous = {}
         self.angular_measures = {}
+        self.last_written_events = {
+            name: 0 for name in diagnostic.species_names}
+        self.active_timing = {}
+        self.final_flush = False
+
+    def has_unwritten_events(self):
+        local_pending = any(
+            accumulator.completed_event_count
+            > self.last_written_events.get(species_name, 0)
+            for species_name, accumulator
+            in self.diagnostic.accumulators.items())
+        diagnostic = self.diagnostic
+        size = 1 if diagnostic.comm is None else diagnostic.comm.size
+        if size == 1:
+            return local_pending
+        return bool(comm_simple.allreduce(int(local_pending)))
 
     def _reduce(self, value):
         diagnostic = self.diagnostic
         size = 1 if diagnostic.comm is None else diagnostic.comm.size
         if size == 1:
-            return value.copy()
+            # Snapshot arrays are already private, read-only writer inputs.
+            return value
         receive = np.empty_like(value) if diagnostic.rank == 0 else None
         comm_simple.Reduce(value, receive, root=0)
         return receive
 
-    def _reduce_snapshot(self, snapshot):
+    def _reduce_max(self, value):
+        diagnostic = self.diagnostic
+        size = 1 if diagnostic.comm is None else diagnostic.comm.size
+        if size == 1:
+            return value
+        gathered = comm_simple.gather(value, root=0)
+        if diagnostic.rank != 0:
+            return None
+        return np.maximum.reduce(gathered)
+
+    def _reduce_moments(self, value):
+        diagnostic = self.diagnostic
+        size = 1 if diagnostic.comm is None else diagnostic.comm.size
+        if size == 1:
+            return value
+        gathered = comm_simple.gather(value, root=0)
+        if diagnostic.rank != 0:
+            return None
+        merged = np.zeros_like(value)
+        for item in gathered:
+            merged = merge_source_moment_stats(merged, item)
+        return merged
+
+    def _reduce_timing(self, timing):
+        diagnostic = self.diagnostic
+        size = 1 if diagnostic.comm is None else diagnostic.comm.size
+        if size == 1:
+            return dict(timing)
+        gathered = comm_simple.gather(dict(timing), root=0)
+        if diagnostic.rank != 0:
+            return None
+        nonempty = [
+            item for item in gathered if item["event_count"] > 0]
+        if not nonempty:
+            return {
+                "event_count": 0,
+                "first_event_center": math.inf,
+                "last_event_center": -math.inf,
+                "represented_interval_start": math.inf,
+                "represented_interval_end": -math.inf,
+            }
         return {
+            "event_count": max(
+                item["event_count"] for item in nonempty),
+            "first_event_center": min(
+                item["first_event_center"] for item in nonempty),
+            "last_event_center": max(
+                item["last_event_center"] for item in nonempty),
+            "represented_interval_start": min(
+                item["represented_interval_start"] for item in nonempty),
+            "represented_interval_end": max(
+                item["represented_interval_end"] for item in nonempty),
+        }
+
+    def _reduce_snapshot(self, snapshot):
+        reduced = {
             category: {
                 key: self._reduce(snapshot[category][key])
                 for key in sorted(snapshot[category])
             }
-            for category in ("data", "accounting", "moments")
+            for category in _ADDITIVE_SNAPSHOT_CATEGORIES
         }
+        reduced["quality"] = {
+            key: self._reduce_max(snapshot["quality"][key])
+            for key in sorted(snapshot["quality"])}
+        reduced["moments"] = {
+            key: self._reduce_moments(snapshot["moments"][key])
+            for key in sorted(snapshot["moments"])}
+        reduced["timing"] = self._reduce_timing(snapshot["timing"])
+        return reduced
 
     def _snapshots(self):
         modes = {}
+        self.active_timing = {}
+        self.pending_previous = {}
         for species_name, accumulator in self.diagnostic.accumulators.items():
             current = accumulator.snapshot()
-            previous = self.previous.get(
-                species_name, _zero_snapshot_like(current))
-            interval = _subtract_snapshot(current, previous)
-            self.previous[species_name] = current
             selected = {}
             if self.output_mode in ("cumulative", "both"):
                 selected["cumulative"] = self._reduce_snapshot(current)
             if self.output_mode in ("interval", "both"):
+                interval_state = accumulator.snapshot(
+                    interval_moments=True)
+                previous = self.previous.get(species_name)
+                if previous is None:
+                    # The first interval is the cumulative state itself. A
+                    # shallow mapping is sufficient because writer inputs are
+                    # never mutated.
+                    interval = {
+                        category: dict(current[category])
+                        for category in _ADDITIVE_SNAPSHOT_CATEGORIES}
+                else:
+                    interval = _subtract_snapshot(current, previous)
+                interval["quality"] = interval_state["quality"]
+                interval["moments"] = interval_state["moments"]
+                interval["timing"] = interval_state["timing"]
+                # The cumulative host snapshot is already detached from the
+                # accumulator. Reuse it as the next frozen interval baseline
+                # instead of copying every dense product a second time.
+                self.pending_previous[species_name] = {
+                    category: dict(current[category])
+                    for category in _ADDITIVE_SNAPSHOT_CATEGORIES}
                 selected["interval"] = self._reduce_snapshot(interval)
+            for mode, snapshot in selected.items():
+                self.active_timing[(species_name, mode)] = snapshot["timing"]
             modes[species_name] = selected
         return modes
 
@@ -392,6 +613,28 @@ class ObserverRadiationWriter(object):
         record.attrs["sampledAngleCap"] = 0.5 * math.pi
         record.attrs["samplesPerParticle"] = accumulator.samples_per_particle
         record.attrs["particleBatchSize"] = accumulator.particle_batch_size
+        record.attrs["randomSeed"] = np.uint64(accumulator.random_seed)
+        record.attrs["randomSamplingMethod"] = _bytes(
+            "stateless_splitmix64_physical_event_key")
+        record.attrs["randomEventKey"] = _bytes(
+            "simulation_event_index_and_integer_centered_phase_space")
+        record.attrs["randomOrderIndependence"] = _bytes(
+            "particle_batching;particle_sorting;MPI_ownership;"
+            "CPU_GPU_execution_order")
+        record.attrs["particleSamplingFraction"] = (
+            accumulator.particle_sampling_fraction)
+        record.attrs["particleThinning"] = np.uint32(
+            accumulator.particle_sampling_fraction < 1.0)
+        record.attrs["particleThinningEstimator"] = _bytes(
+            "Bernoulli_Horvitz_Thompson_linear_in_macroparticle_weight")
+        record.attrs["estimatedDenseProductBytes"] = np.uint64(
+            accumulator.estimated_dense_product_bytes)
+        record.attrs["maxAllocationBytes"] = (
+            np.uint64(accumulator.max_allocation_bytes)
+            if accumulator.max_allocation_bytes is not None
+            else _bytes("unlimited"))
+        record.attrs["allocationBreakdown"] = _bytes(json.dumps(
+            accumulator.allocation_breakdown, sort_keys=True))
         record.attrs["gammaThreshold"] = accumulator.gamma_cutoff
         record.attrs["particleSelection"] = _bytes(json.dumps(
             accumulator.particle_selection,
@@ -402,6 +645,13 @@ class ObserverRadiationWriter(object):
         record.attrs["spectralClosureTailTreatment"] = _bytes(
             "reported_as_unrepresented_energy_not_renormalized")
         record.attrs["angularMeasure"] = _bytes(accumulator.angular_measure)
+        record.attrs["angularDensityMeasure"] = _bytes(
+            "per_solid_angle" if accumulator.angular_measure == "solid_angle"
+            else "per_projected_angle_measure_dtheta_x_dtheta_y")
+        record.attrs["angularJacobianTreatment"] = _bytes(
+            "exact_spherical_cell_solid_angle"
+            if accumulator.angular_measure == "solid_angle"
+            else "projected_angle_bin_area")
         record.attrs["angularCoordinateConvention"] = _bytes(
             "theta_x=atan2(n_x,n_z);theta_y=atan2(n_y,n_z)")
         record.attrs["photonEnergyDefinition"] = _bytes(
@@ -410,9 +660,45 @@ class ObserverRadiationWriter(object):
             "incoherent_linear_in_weight")
         record.attrs["radiationReaction"] = np.uint32(0)
         record.attrs["passiveDiagnostic"] = np.uint32(1)
+        record.attrs["eventModel"] = _bytes(
+            "centered_covariant_pusher_impulse_v1")
+        record.attrs["accelerationSource"] = _bytes(
+            "completed_particle_momentum_push_not_gathered_fields")
         record.attrs["picEventTimeStaggering"] = _bytes(
-            "position_and_momentum_at_particle_half_step;"
-            "fields_from_preceding_integer_step")
+            "position_at_integer_time_center;"
+            "momentum_endpoints_at_n_minus_and_plus_one_half")
+        record.attrs["diagnosticWritePhase"] = _bytes(
+            "post_momentum_impulse_pre_elementary_process")
+        record.attrs["eventFourVelocityDefinition"] = _bytes(
+            "normalized_sum_of_dimensionless_endpoint_four_velocities")
+        record.attrs["eventFourAccelerationDefinition"] = _bytes(
+            "c_times_endpoint_four_velocity_difference_over_centered_"
+            "proper_time")
+        record.attrs["eventInvariantContract"] = _bytes(
+            "U_squared_equals_c_squared;U_dot_A_equals_zero")
+        record.attrs["observerCoordinateTimeWeight"] = _bytes(
+            "delta_t_observer=gamma_observer*delta_tau")
+        record.attrs["observerTimeConvention"] = _bytes(
+            "tau_D=t_observer-n_D_dot_x_observer/c")
+        record.attrs["retardedTimeEvaluation"] = _bytes(
+            "observer_light_front_coordinates_cancellation_safe")
+        record.attrs["finalFlush"] = np.uint32(self.final_flush)
+        timing = self.active_timing.get((species_name, mode))
+        if timing is not None:
+            record.attrs["representedEventCount"] = np.uint64(
+                timing["event_count"])
+            if timing["event_count"] > 0:
+                record.attrs["firstEventCenterTimeSimulation"] = (
+                    timing["first_event_center"])
+                record.attrs["lastEventCenterTimeSimulation"] = (
+                    timing["last_event_center"])
+                record.attrs["representedIntervalStartSimulation"] = (
+                    timing["represented_interval_start"])
+                record.attrs["representedIntervalEndSimulation"] = (
+                    timing["represented_interval_end"])
+                record.attrs["representedIntervalConvention"] = _bytes(
+                    "centered_momentum_push_coordinate_time_interval")
+                record.attrs["eventTimingUnitSI"] = 1.0
         record.attrs["unitSI"] = 1.0
         record.attrs["timeOffset"] = 0.0
 
@@ -581,11 +867,23 @@ class ObserverRadiationWriter(object):
             record.attrs["sourceEffectiveAngularMeasure"] = _bytes(
                 effective_measure)
             if "time" in projection["axes"]:
-                record.attrs["observerTimeDefinition"] = _bytes(
-                    "t_observer_minus_sampled_photon_direction_dot_r_over_c")
-                record.attrs["observerTimeConditioning"] = _bytes(
-                    "direction_conditioned_radiation_phase_coordinate;"
-                    "angle_marginals_mix_distinct_null_coordinates")
+                reference = projection["time_reference"]
+                record.attrs["sourceTimeReference"] = _bytes(reference)
+                if reference == "photon_direction":
+                    record.attrs["observerTimeDefinition"] = _bytes(
+                        "t_observer_minus_sampled_photon_direction_dot_"
+                        "r_over_c")
+                    record.attrs["observerTimeConditioning"] = _bytes(
+                        "direction_conditioned_radiation_phase_coordinate;"
+                        "angle_marginals_mix_distinct_null_coordinates")
+                else:
+                    record.attrs["observerTimeDefinition"] = _bytes(
+                        "tau_D=t_observer-n_D_dot_r_observer/c")
+                    record.attrs["observerTimeConditioning"] = _bytes(
+                        "detector_referenced_source_attribution")
+                    record.attrs["sourceTimeDetector"] = _bytes(reference)
+                    record.attrs["sourceTimeDetectorDirection"] = (
+                        projection["time_direction"])
 
         if key.startswith("detector/"):
             detector_name = key.split("/")[1]
@@ -617,12 +915,26 @@ class ObserverRadiationWriter(object):
                     "curvature_only_finite_synchrotron_CDF_with_reported_tail")
                 record.attrs["bandAngularModel"] = _bytes(
                     "exact_transverse_Lienard_pattern")
-                record.attrs["bandSpectralAngularClosure"] = _bytes(
-                    "separable_transverse_Lienard_angular_pattern_times_"
-                    "angle_integrated_synchrotron_band_fraction")
-                record.attrs["bandEnergyAngleCouplingRetained"] = np.uint32(0)
-                record.attrs["bandClosureScope"] = _bytes(
-                    "approximation;not_the_joint_spectral_angular_kernel")
+                band_mode = detector["energy_band_mode"]
+                record.attrs["bandMode"] = _bytes(band_mode)
+                if band_mode == "joint":
+                    record.attrs["bandSpectralAngularClosure"] = _bytes(
+                        "Schwinger_angle_conditioned_energy_CDF_with_exact_"
+                        "transverse_Lienard_angular_marginal")
+                    record.attrs[
+                        "bandEnergyAngleCouplingRetained"] = np.uint32(1)
+                    record.attrs["bandClosureScope"] = _bytes(
+                        "local_joint_spectral_angular_closure;"
+                        "finite_spectral_tail_reported_separately")
+                else:
+                    record.attrs["bandSpectralAngularClosure"] = _bytes(
+                        "separable_transverse_Lienard_angular_pattern_times_"
+                        "angle_integrated_synchrotron_band_fraction")
+                    record.attrs[
+                        "bandEnergyAngleCouplingRetained"] = np.uint32(0)
+                    record.attrs["bandClosureScope"] = _bytes(
+                        "explicit_fast_approximation;"
+                        "not_the_joint_spectral_angular_kernel")
 
     def _write_product(self, field_group, iteration_group, accumulator,
                        species_name, mode, key, raw):
@@ -697,8 +1009,77 @@ class ObserverRadiationWriter(object):
                     "it_overlaps_energy_above_range_when_that_range_is_finite"),
                 "energyRangeIncludesLongitudinalAcceleration": np.uint32(0),
                 "angularLossAccounting": _bytes(
-                    "sampled_local_curvature_closure"),
+                    "stochastic_spectral_angular_packet_estimator"),
+                "deterministicApertureAccounting": _bytes(
+                    "independent_Lienard_quadrature_estimator"),
+                "apertureComplementSemantics": _bytes(
+                    "stochastic_outside_aperture_and_deterministic_inside_"
+                    "aperture_are_not_reported_as_exact_complements"),
                 "angularLossIncludesLongitudinalAcceleration": np.uint32(0),
+            })
+
+    def _write_quality(self, field_group, accumulator, species_name,
+                       mode, quality):
+        components = {
+            key: (float(value[0]), _DIMENSIONLESS)
+            for key, value in quality.items()}
+        name = "radiationEventQuality_%s_%s" % (
+            _clean(species_name), mode)
+        self._write_component_group(
+            field_group, name, components, accumulator, species_name, mode,
+            {
+                "longName": _bytes(
+                    "centered pusher impulse invariant residuals"),
+                "massShellResidualDefinition": _bytes(
+                    "abs(U_center_squared_over_c_squared_minus_one)_"
+                    "over_Euclidean_four_velocity_norm_squared"),
+                "orthogonalityResidualDefinition": _bytes(
+                    "abs(U_center_dot_A)_over_product_of_Euclidean_norms"),
+                "powerIdentityResidualDefinition": _bytes(
+                    "abs(P_perp_plus_P_parallel_plus_C_A_A_squared)_"
+                    "over_invariant_power"),
+            })
+
+    def _write_sampling(self, field_group, accumulator, species_name,
+                        mode, sampling):
+        components = {}
+        for key, value in sampling.items():
+            dimension = (
+                2.0 * _ENERGY_DIMENSION
+                if key.endswith("_energy_sampling_variance")
+                else _DIMENSIONLESS)
+            components[key] = (float(value[0]), dimension)
+        transverse_variance = float(
+            sampling["transverse_energy_sampling_variance"][0])
+        longitudinal_variance = float(
+            sampling["longitudinal_energy_sampling_variance"][0])
+        components["transverse_energy_sampling_uncertainty"] = (
+            math.sqrt(max(transverse_variance, 0.0)), _ENERGY_DIMENSION)
+        components["longitudinal_energy_sampling_uncertainty"] = (
+            math.sqrt(max(longitudinal_variance, 0.0)), _ENERGY_DIMENSION)
+        effective_weight = float(
+            sampling["effective_sampled_weight"][0])
+        effective_weight_squared = float(
+            sampling["effective_sampled_weight_squared"][0])
+        effective_sample_size = (
+            effective_weight**2 / effective_weight_squared
+            if effective_weight_squared > 0.0 else 0.0)
+        components["effective_sample_size"] = (
+            effective_sample_size, _DIMENSIONLESS)
+        name = "radiationSampling_%s_%s" % (
+            _clean(species_name), mode)
+        self._write_component_group(
+            field_group, name, components, accumulator, species_name, mode,
+            {
+                "longName": _bytes(
+                    "diagnostic particle thinning and uncertainty"),
+                "samplingFraction": accumulator.particle_sampling_fraction,
+                "samplingEstimator": _bytes(
+                    "Bernoulli_Horvitz_Thompson"),
+                "uncertaintyScope": _bytes(
+                    "diagnostic_particle_thinning_only;"
+                    "spectral_angular_packet_noise_reported_by_configuration"),
+                "unbiasedLinearObservables": np.uint32(1),
             })
 
     def _write_moments(self, field_group, accumulator, species_name,
@@ -730,13 +1111,28 @@ class ObserverRadiationWriter(object):
                     "orientation_modulo_pi"),
             }
             if "time" in selection["quantities"]:
-                attributes.update({
-                    "observerTimeDefinition": _bytes(
-                        "t_observer_minus_sampled_photon_direction_dot_r_over_c"),
-                    "observerTimeConditioning": _bytes(
-                        "direction_conditioned_radiation_phase_coordinate;"
-                        "angle_marginals_mix_distinct_null_coordinates"),
-                })
+                reference = selection["time_reference"]
+                if reference == "photon_direction":
+                    attributes.update({
+                        "sourceTimeReference": _bytes(reference),
+                        "observerTimeDefinition": _bytes(
+                            "t_observer_minus_sampled_photon_direction_dot_"
+                            "r_over_c"),
+                        "observerTimeConditioning": _bytes(
+                            "direction_conditioned_radiation_phase_coordinate;"
+                            "angle_marginals_mix_distinct_null_coordinates"),
+                    })
+                else:
+                    attributes.update({
+                        "sourceTimeReference": _bytes(reference),
+                        "observerTimeDefinition": _bytes(
+                            "tau_D=t_observer-n_D_dot_r_observer/c"),
+                        "observerTimeConditioning": _bytes(
+                            "detector_referenced_source_attribution"),
+                        "sourceTimeDetector": _bytes(reference),
+                        "sourceTimeDetectorDirection": (
+                            selection["time_direction"]),
+                    })
             self._write_component_group(
                 field_group, name, source_moment_components(
                     stats, selection["quantities"]),
@@ -777,13 +1173,16 @@ class ObserverRadiationWriter(object):
                         "peakDefinition": _bytes("maximum_bin_average_power"),
                     })
 
-    def write(self, iteration):
+    def write(self, iteration, final_flush=False):
         diagnostic = self.diagnostic
         file_handle = None
+        successful = False
+        self.final_flush = bool(final_flush)
         if diagnostic.use_cuda:
             for species_name in diagnostic.species_names:
-                diagnostic.species[species_name].synchrotron_radiator \
-                    .receive_from_gpu()
+                radiator = diagnostic.species[
+                    species_name].synchrotron_radiator
+                radiator.receive_from_gpu()
         try:
             snapshots = self._snapshots()
             first = next(iter(diagnostic.accumulators.values()))
@@ -794,42 +1193,61 @@ class ObserverRadiationWriter(object):
             filename = "data%08d.h5" % iteration
             fullpath = os.path.join(diagnostic.write_dir, "hdf5", filename)
             file_handle = diagnostic.open_file(fullpath)
-            if file_handle is None:
-                return
-            diagnostic.setup_openpmd_file(
-                file_handle, iteration, observer_time, observer_dt)
-            iteration_group = file_handle["/data/%d" % iteration]
-            iteration_group.attrs["timeReferenceFrame"] = _bytes(
-                first.observer_frame)
-            iteration_group.attrs["timeReferenceEvent"] = _bytes(
-                "simulation_origin_z_equals_zero")
-            iteration_group.attrs["observerLorentzTransform"] = \
-                self._lorentz_matrix(first).ravel()
-            iteration_group.attrs["observerLorentzTransformShape"] = \
-                np.array([4, 4], dtype=np.uint64)
-            iteration_group.attrs["observerTranslation"] = \
-                first.observer_translation
-            field_group = iteration_group.require_group("fields")
-            for species_name, mode_snapshots in snapshots.items():
-                accumulator = diagnostic.accumulators[species_name]
-                for mode, snapshot in mode_snapshots.items():
-                    for key, raw in snapshot["data"].items():
-                        self._write_product(
-                            field_group, iteration_group, accumulator,
-                            species_name, mode, key, raw)
-                    self._write_accounting(
-                        field_group, accumulator, species_name, mode,
-                        snapshot["accounting"])
-                    self._write_moments(
-                        field_group, accumulator, species_name, mode,
-                        snapshot["moments"])
-                    self._write_pulse_metrics(
-                        field_group, accumulator, species_name, mode,
-                        snapshot["data"])
+            if file_handle is not None:
+                diagnostic.setup_openpmd_file(
+                    file_handle, iteration, observer_time, observer_dt)
+                iteration_group = file_handle["/data/%d" % iteration]
+                iteration_group.attrs["timeReferenceFrame"] = _bytes(
+                    first.observer_frame)
+                iteration_group.attrs["timeReferenceEvent"] = _bytes(
+                    "simulation_origin_z_equals_zero")
+                iteration_group.attrs["radiationOutputPhase"] = _bytes(
+                    "post_centered_pusher_impulse")
+                iteration_group.attrs["radiationFinalFlush"] = np.uint32(
+                    final_flush)
+                iteration_group.attrs["observerLorentzTransform"] = (
+                    self._lorentz_matrix(first).ravel())
+                iteration_group.attrs["observerLorentzTransformShape"] = (
+                    np.array([4, 4], dtype=np.uint64))
+                iteration_group.attrs["observerTranslation"] = (
+                    first.observer_translation)
+                field_group = iteration_group.require_group("fields")
+                for species_name, mode_snapshots in snapshots.items():
+                    accumulator = diagnostic.accumulators[species_name]
+                    for mode, snapshot in mode_snapshots.items():
+                        for key, raw in snapshot["data"].items():
+                            self._write_product(
+                                field_group, iteration_group, accumulator,
+                                species_name, mode, key, raw)
+                        self._write_accounting(
+                            field_group, accumulator, species_name, mode,
+                            snapshot["accounting"])
+                        self._write_quality(
+                            field_group, accumulator, species_name, mode,
+                            snapshot["quality"])
+                        self._write_sampling(
+                            field_group, accumulator, species_name, mode,
+                            snapshot["sampling"])
+                        self._write_moments(
+                            field_group, accumulator, species_name, mode,
+                            snapshot["moments"])
+                        self._write_pulse_metrics(
+                            field_group, accumulator, species_name, mode,
+                            snapshot["data"])
+            successful = True
         finally:
             if file_handle is not None:
                 file_handle.close()
+            if successful:
+                self.previous = self.pending_previous
+                for species_name, accumulator in (
+                        diagnostic.accumulators.items()):
+                    self.last_written_events[species_name] = (
+                        accumulator.completed_event_count)
+                    accumulator.reset_interval_state()
+            self.final_flush = False
             if diagnostic.use_cuda:
                 for species_name in diagnostic.species_names:
-                    diagnostic.species[species_name].synchrotron_radiator \
-                        .send_to_gpu()
+                    radiator = diagnostic.species[
+                        species_name].synchrotron_radiator
+                    radiator.send_to_gpu()

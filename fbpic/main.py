@@ -477,6 +477,8 @@ class Simulation(object):
             # (after gathering ; allows output of gathered fields on particles)
             # (E, B, rho, x are defined at time n ; J, p at time n-1/2)
             for diag in self.diags:
+                if getattr(diag, "write_after_momentum_push", False):
+                    continue
                 # Check if the diagnostic should be written at this iteration
                 # (If needed: bring rho/J from spectral space, where they
                 # were smoothed/corrected, and copy the data from the GPU.)
@@ -491,6 +493,14 @@ class Simulation(object):
             if move_momenta:
                 for species in ptcl:
                     species.push_p( self.time + 0.5*self.dt )
+
+            # Radiation events are complete: momentum endpoints bracket the
+            # push and positions remain at its integer-time center. Keep this
+            # phase separate from ordinary diagnostics and from the discrete
+            # elementary-process momentum changes below.
+            for diag in self.diags:
+                if getattr(diag, "write_after_momentum_push", False):
+                    diag.write( self.iteration )
             if move_positions:
                 for species in ptcl:
                     species.push_x( 0.5*dt )
@@ -579,6 +589,15 @@ class Simulation(object):
 
         # End of the N iterations
         # -----------------------
+
+        # A cadence boundary need not coincide with the end of step.
+        # Flush any completed radiation event not yet represented in output.
+        for diag in self.diags:
+            if getattr(diag, "write_after_momentum_push", False):
+                # The last completed impulse is centered at iteration - 1.
+                # Using that event iteration avoids colliding with a future
+                # scheduled write if this Simulation is stepped again.
+                diag.flush( max(0, self.iteration - 1) )
 
         # Finalize PIC loop
         # Get the charge density and the current from spectral space.

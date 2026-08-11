@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import h5py
 import numpy as np
 import pytest
-from scipy.constants import c, e, epsilon_0, m_e
+from scipy.constants import c, e, epsilon_0, hbar, m_e
 
+from fbpic.main import Simulation
 from fbpic.openpmd_diag import SynchrotronRadiationDiagnostic
 from fbpic.openpmd_diag.observer_radiation_diag import (
     angular_cell_measure,
@@ -22,11 +23,14 @@ from fbpic.particles.elementary_process.synchrotron.radiator import (
     SynchrotronRadiator,
     _cached_spectral_cdf,
 )
+from fbpic.particles.particles import Particles
+from fbpic.particles.push.numba_methods import push_p_numba
+from fbpic.utils.cuda import cuda_installed
 
 
-POWER_FACTOR = e**2 / (6.0 * np.pi * epsilon_0 * c)
+FOUR_ACCELERATION_POWER_FACTOR = (
+    e**2 / (6.0 * np.pi * epsilon_0 * c**3))
 ANGULAR_POWER_FACTOR = e**2 / (16.0 * np.pi**2 * epsilon_0 * c)
-E_MC = e / (m_e * c)
 
 
 def _species(u, electric, c_magnetic, dt=2.0e-18, count=1, weight=1.0,
@@ -53,6 +57,7 @@ def _species(u, electric, c_magnetic, dt=2.0e-18, count=1, weight=1.0,
         Bx=full(c_magnetic[0] / c), By=full(c_magnetic[1] / c),
         Bz=full(c_magnetic[2] / c), w=full(weight),
         inv_gamma=full(1.0 / gamma), synchrotron_radiator=None,
+        injector=None, ionizer=None,
     )
 
 
@@ -75,21 +80,71 @@ def _diagnostic(tmp_path, species, **kwargs):
     )
 
 
-def _power_oracle(u, electric, c_magnetic):
-    u = np.asarray(u, dtype=np.float64)
-    gamma = math.sqrt(1.0 + np.dot(u, u))
-    beta = u / gamma
-    du = -E_MC * (electric + np.cross(beta, c_magnetic))
-    dgamma = -E_MC * np.dot(beta, electric)
+def _complete_impulse(radiator, species, simulation_time):
+    lower = radiator.begin_momentum_push()
+    push_p_numba(
+        species.ux, species.uy, species.uz, species.inv_gamma,
+        species.Ex, species.Ey, species.Ez,
+        species.Bx, species.By, species.Bz,
+        species.q, species.m, species.Ntot, species.dt,
+    )
+    radiator.end_momentum_push(lower, simulation_time)
+    return lower
+
+
+def _impulse_oracle(lower, upper, dt, gamma_boost=1.0, beta_boost=0.0):
+    lower = np.asarray(lower, dtype=np.float64)
+    upper = np.asarray(upper, dtype=np.float64)
+    gamma_minus = math.sqrt(1.0 + np.dot(lower, lower))
+    gamma_plus = math.sqrt(1.0 + np.dot(upper, upper))
+    delta_u = upper - lower
+    gamma_sum = gamma_plus + gamma_minus
+    delta_gamma = np.dot(delta_u, upper + lower) / gamma_sum
+    norm = math.sqrt(4.0 + np.dot(delta_u, delta_u) - delta_gamma**2)
+    four_u_sim = np.concatenate((
+        [(gamma_plus + gamma_minus) / norm],
+        (upper + lower) / norm,
+    ))
+    delta_tau = dt / four_u_sim[0]
+    four_a_sim = c * np.concatenate(([delta_gamma], delta_u)) / delta_tau
+    matrix = np.array([
+        [gamma_boost, 0.0, 0.0, gamma_boost * beta_boost],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+        [gamma_boost * beta_boost, 0.0, 0.0, gamma_boost],
+    ])
+    four_u = matrix @ four_u_sim
+    four_a = matrix @ four_a_sim
+    gamma = four_u[0]
+    beta = four_u[1:] / gamma
     beta2 = np.dot(beta, beta)
-    cross2 = np.dot(np.cross(beta, du), np.cross(beta, du))
-    perpendicular = POWER_FACTOR * gamma**2 * cross2 / beta2
-    parallel = POWER_FACTOR * dgamma**2 / beta2
-    dot_beta = (du - beta * dgamma) / gamma
-    parallel_coefficient = dgamma / beta2
-    dot_beta_perp = (du - beta * parallel_coefficient) / gamma
-    omega_c = 1.5 * gamma**2 * math.sqrt(cross2) / beta2**1.5
-    return perpendicular, parallel, omega_c, beta, dot_beta, dot_beta_perp
+    cross = np.cross(beta, four_a[1:])
+    perpendicular = (
+        FOUR_ACCELERATION_POWER_FACTOR * np.dot(cross, cross) / beta2)
+    parallel = (
+        FOUR_ACCELERATION_POWER_FACTOR * four_a[0]**2
+        / (gamma**2 * beta2))
+    omega_c = (
+        1.5 * gamma * np.linalg.norm(cross)
+        / (c * beta2**1.5))
+    dot_beta = (
+        four_a[1:] - beta * four_a[0]) / (c * gamma**2)
+    a_parallel = beta * four_a[0] / beta2
+    dot_beta_perp = (four_a[1:] - a_parallel) / (c * gamma**2)
+    return {
+        "four_u_sim": four_u_sim,
+        "four_a_sim": four_a_sim,
+        "four_u": four_u,
+        "four_a": four_a,
+        "delta_tau": delta_tau,
+        "dt_observer": gamma * delta_tau,
+        "p_perp": perpendicular,
+        "p_parallel": parallel,
+        "omega_c": omega_c,
+        "beta": beta,
+        "dot_beta": dot_beta,
+        "dot_beta_perp": dot_beta_perp,
+    }
 
 
 def _angular_power_oracle(direction, beta, dot_beta):
@@ -131,7 +186,7 @@ def _attribute_text(value):
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
-def test_activation_validates_species_cutoff_and_spectral_tail():
+def test_activation_validates_species_cutoff_and_spectral_tail(tmp_path):
     u = np.array([0.0, 0.0, 20.0])
     fields = np.zeros(3)
     with pytest.raises(ValueError, match="electrons and positrons"):
@@ -158,6 +213,20 @@ def test_activation_validates_species_cutoff_and_spectral_tail():
         np.diff(np.log(cached[0][1:])),
         np.diff(np.log(cached[0][1:]))[0],
     )
+
+    tiny_species = _species(u, fields, fields)
+    tiny_radiator = _activate(tiny_species, x_max=1.0e-10)
+    tiny_diagnostic = _diagnostic(
+        tmp_path / "tiny_kernel", tiny_species,
+        photon_energy_edges=np.array([0.0, 1.0e-20]),
+        theta_x_edges=np.array([-0.1, 0.1]),
+        theta_y_edges=np.array([-0.1, 0.1]),
+    )
+    tiny_kernel = tiny_diagnostic.accumulators[
+        "electrons"].angular_kernel_x
+    assert tiny_kernel[-1] == pytest.approx(1.0e-10)
+    assert np.all(np.diff(tiny_kernel) > 0.0)
+    assert tiny_radiator.observer_accumulator is not None
 
 
 def test_projected_angle_chart_is_validated_at_every_entry_point(tmp_path):
@@ -219,33 +288,57 @@ def test_boosted_event_power_position_and_worldline_interval(tmp_path):
         source_projections=[{"name": "x", "axes": ("x",)}],
     )
     accumulator = diagnostic.accumulators["electrons"]
+    lower = _complete_impulse(radiator, species, ct_sim / c)
+    lower_vector = np.array([component[0] for component in lower])
+    upper_vector = np.array([
+        species.ux[0], species.uy[0], species.uz[0]])
+    oracle = _impulse_oracle(
+        lower_vector, upper_vector, species.dt,
+        gamma_boost, beta_boost)
     event = accumulator._observer_event(
-        species, ct_sim / c, np, slice(None))
-    perpendicular, parallel, omega_c, _, _, _ = _power_oracle(
-        u_lab, electric_lab, c_magnetic_lab)
-    gamma_lab = math.sqrt(1.0 + np.dot(u_lab, u_lab))
+        species, lower, ct_sim / c, np, slice(None))
 
-    assert event["gamma"][0] == pytest.approx(gamma_lab, rel=3.0e-14)
+    assert event["gamma"][0] == pytest.approx(
+        oracle["four_u"][0], rel=4.0e-14)
     assert np.array([
         event["ux"][0], event["uy"][0], event["uz"][0],
-    ]) == pytest.approx(u_lab, rel=3.0e-14)
-    assert event["dt_ratio"][0] == pytest.approx(
-        gamma_lab / gamma_sim, rel=3.0e-14)
-    assert event["p_perp"][0] == pytest.approx(perpendicular, rel=4.0e-14)
-    assert event["p_parallel"][0] == pytest.approx(parallel, rel=4.0e-14)
-    assert event["omega_c"][0] == pytest.approx(omega_c, rel=4.0e-14)
+    ]) == pytest.approx(oracle["four_u"][1:], rel=4.0e-14)
+    assert event["dt_observer"][0] == pytest.approx(
+        oracle["dt_observer"], rel=4.0e-14)
+    assert event["p_perp"][0] == pytest.approx(
+        oracle["p_perp"], rel=8.0e-13)
+    assert event["p_parallel"][0] == pytest.approx(
+        oracle["p_parallel"], rel=8.0e-13)
+    assert event["omega_c"][0] == pytest.approx(
+        oracle["omega_c"], rel=8.0e-13)
     assert event["x"][0] == pytest.approx(x_lab + translation[1])
     assert event["y"][0] == pytest.approx(y_lab + translation[2])
     assert event["z"][0] == pytest.approx(z_lab + translation[3])
     assert event["time"][0] == pytest.approx(
         (ct_lab + translation[0]) / c)
 
-    radiator.handle_radiation(ct_sim / c)
-    scale = species.w[0] * species.dt * gamma_lab / gamma_sim
+    minkowski_u2 = (
+        oracle["four_u_sim"][0]**2
+        - np.dot(oracle["four_u_sim"][1:],
+                 oracle["four_u_sim"][1:]))
+    u_dot_a = (
+        oracle["four_u_sim"][0] * oracle["four_a_sim"][0]
+        - np.dot(oracle["four_u_sim"][1:],
+                 oracle["four_a_sim"][1:]))
+    invariant_scale = (
+        np.linalg.norm(oracle["four_u_sim"])
+        * np.linalg.norm(oracle["four_a_sim"]))
+    assert minkowski_u2 == pytest.approx(1.0, rel=5.0e-13)
+    assert abs(u_dot_a) <= 2.0e-14 * invariant_scale
+    assert event["orthogonality_relative_error"][0] < 2.0e-14
+    assert event["p_perp"][0] + event["p_parallel"][0] == pytest.approx(
+        event["invariant_power"][0], rel=2.0e-11)
+
+    scale = species.w[0] * oracle["dt_observer"]
     assert accumulator.accounting["transverse_energy"][0] == pytest.approx(
-        perpendicular * scale, rel=4.0e-14)
+        oracle["p_perp"] * scale, rel=8.0e-13)
     assert accumulator.accounting["longitudinal_energy"][0] == pytest.approx(
-        parallel * scale, rel=4.0e-14)
+        oracle["p_parallel"] * scale, rel=8.0e-13)
 
 
 def test_ultrarelativistic_on_axis_angular_power_is_stable():
@@ -272,6 +365,19 @@ def test_ultrarelativistic_on_axis_angular_power_is_stable():
     )
     assert np.isfinite(value)
     assert value == pytest.approx(expected, rel=3.0e-15)
+
+
+def test_retarded_time_uses_stable_observer_light_front_coordinates():
+    # Reconstructing ct and z separately erases this small null coordinate.
+    event = {
+        "ct_plus_z": np.array([2.0e20]),
+        "ct_minus_z": np.array([3.0e-6]),
+        "x": np.array([0.0]),
+        "y": np.array([0.0]),
+    }
+    tau = ObserverFrameRadiationAccumulator._retarded_time(
+        event, np.array([0.0, 0.0, 1.0]))
+    assert tau[0] == pytest.approx(3.0e-6 / c, rel=2.0e-16)
 
 
 def test_broadband_aperture_is_deterministic_and_band_is_labeled(tmp_path):
@@ -302,23 +408,32 @@ def test_broadband_aperture_is_deterministic_and_band_is_labeled(tmp_path):
     )
     accumulator = diagnostic.accumulators["electrons"]
     assert not accumulator.needs_spectral_samples
-    assert accumulator.angular_kernel_x is None
+    assert accumulator.needs_joint_band_model
+    assert accumulator.angular_kernel_x is not None
     assert "energy_outside_apertures" not in accumulator.accounting
 
-    radiator.handle_radiation(0.0)
-    _, _, _, beta, dot_beta, dot_beta_perp = _power_oracle(
-        u, electric, c_magnetic)
+    lower = _complete_impulse(radiator, species, 0.0)
+    lower_vector = np.array([component[0] for component in lower])
+    upper_vector = np.array([
+        species.ux[0], species.uy[0], species.uz[0]])
+    oracle = _impulse_oracle(lower_vector, upper_vector, species.dt)
+    event = accumulator._observer_event(
+        species, lower, 0.0, np, slice(None))
     expected_broadband = (
-        species.w[0] * species.dt
-        * _angular_power_oracle(direction, beta, dot_beta)
+        species.w[0] * oracle["dt_observer"]
+        * _angular_power_oracle(
+            direction, oracle["beta"], oracle["dot_beta"])
     )
     direction_key = "detector/selected/direction"
     assert accumulator.data[direction_key].sum() == pytest.approx(
         expected_broadband, rel=3.0e-13)
+    band_fraction = accumulator._joint_band_fraction(
+        direction, event, (0.0, 1.0), np)[0]
     expected_band = (
-        species.w[0] * species.dt
-        * _angular_power_oracle(direction, beta, dot_beta_perp)
-        * accumulator.spectral_cdf[-1]
+        species.w[0] * oracle["dt_observer"]
+        * _angular_power_oracle(
+            direction, oracle["beta"], oracle["dot_beta_perp"])
+        * band_fraction
     )
     band_key = "detector/selected/band/all/direction"
     assert accumulator.data[band_key].sum() == pytest.approx(
@@ -333,16 +448,17 @@ def test_broadband_aperture_is_deterministic_and_band_is_labeled(tmp_path):
             value for value in fields
             if "ObserverTime_selected_band_all_direction" in value)
         record = fields[name]
-        assert record.attrs["bandEnergyAngleCouplingRetained"] == 0
-        assert "separable" in _attribute_text(
+        assert record.attrs["bandEnergyAngleCouplingRetained"] == 1
+        assert "angle_conditioned" in _attribute_text(
             record.attrs["bandSpectralAngularClosure"])
-        assert "not_the_joint" in _attribute_text(
-            record.attrs["bandClosureScope"])
+        assert _attribute_text(record.attrs["bandMode"]) == "joint"
         assert record.attrs[
             "spectralClosureTruncatedEnergyFraction"] == pytest.approx(
                 radiator.spectral_truncated_fraction)
-        assert "preceding_integer_step" in _attribute_text(
+        assert "integer_time_center" in _attribute_text(
             record.attrs["picEventTimeStaggering"])
+        assert _attribute_text(record.attrs["eventModel"]) == (
+            "centered_covariant_pusher_impulse_v1")
 
 
 def test_position_only_source_moments_are_deterministic(tmp_path):
@@ -367,7 +483,7 @@ def test_position_only_source_moments_are_deterministic(tmp_path):
     accumulator = diagnostic.accumulators["electrons"]
     assert not accumulator.needs_spectral_samples
     assert accumulator.angular_kernel_x is None
-    radiator.handle_radiation(0.0)
+    _complete_impulse(radiator, species, 0.0)
 
     stats = accumulator.moment_stats["position"]
     components = source_moment_components(stats, ("position",))
@@ -386,11 +502,13 @@ def test_schwinger_conditional_narrows_with_photon_energy(tmp_path):
     gamma = 80.0
     count = 6000
     u = np.array([0.0, 0.0, math.sqrt(gamma**2 - 1.0)])
+    positions = np.zeros((count, 3))
+    positions[:, 0] = np.linspace(-1.0e-6, 1.0e-6, count)
     species = _species(
         u, [0.0, 0.0, 0.0], [0.0, 2.0e10, 0.0],
-        count=count,
+        count=count, positions=positions,
     )
-    _activate(species)
+    radiator = _activate(species)
     diagnostic = _diagnostic(
         tmp_path, species,
         photon_energy_edges=np.array([0.0, 1.0e-12]),
@@ -398,14 +516,14 @@ def test_schwinger_conditional_narrows_with_photon_energy(tmp_path):
         theta_y_edges=np.array([-0.2, 0.0, 0.2]),
     )
     accumulator = diagnostic.accumulators["electrons"]
-    event = accumulator._observer_event(species, 0.0, np, slice(None))
+    lower = _complete_impulse(radiator, species, 0.0)
+    event = accumulator._observer_event(
+        species, lower, 0.0, np, slice(None))
 
-    np.random.seed(10)
     low = accumulator._sample_direction(
-        event, np.full(count, 0.02), np)
-    np.random.seed(11)
+        event, np.full(count, 0.02), np, sample_index=0)
     high = accumulator._sample_direction(
-        event, np.full(count, 4.0), np)
+        event, np.full(count, 4.0), np, sample_index=1)
     low_normal_angle = np.arctan2(low[1], low[2])
     high_normal_angle = np.arctan2(high[1], high[2])
     assert np.std(low_normal_angle) > 2.0 * np.std(high_normal_angle)
@@ -436,13 +554,14 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
     accumulator = diagnostic.accumulators["electrons"]
     assert accumulator.needs_spectral_samples
 
-    np.random.seed(4)
-    radiator.handle_radiation(0.0)
-    one_step_energy = float(
+    _complete_impulse(radiator, species, 0.0)
+    first_step_energy = float(
         accumulator.accounting["transverse_energy"][0])
     diagnostic.write_hdf5(1)
-    np.random.seed(5)
-    radiator.handle_radiation(species.dt)
+    _complete_impulse(radiator, species, species.dt)
+    cumulative_energy = float(
+        accumulator.accounting["transverse_energy"][0])
+    second_step_energy = cumulative_energy - first_step_energy
     diagnostic.write_hdf5(2)
 
     with h5py.File(
@@ -464,6 +583,14 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
         moment = fields[moment_name]
         assert "direction_conditioned" in _attribute_text(
             moment.attrs["observerTimeConditioning"])
+        assert any(
+            "SourceMoments_all" in name
+            and name.endswith("covariance_theta_x_observer_time")
+            for name in fields)
+        assert any(
+            "SourceMoments_all" in name
+            and name.endswith("correlation_theta_y_observer_time")
+            for name in fields)
 
         cumulative_name = next(
             name for name in fields
@@ -472,9 +599,463 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
             name for name in fields
             if "Accounting_electrons_interval_transverse_energy" in name)
         assert fields[cumulative_name][0] == pytest.approx(
-            2.0 * one_step_energy, rel=3.0e-14)
+            cumulative_energy, rel=3.0e-14)
         assert fields[interval_name][0] == pytest.approx(
-            one_step_energy, rel=3.0e-14)
+            second_step_energy, rel=3.0e-14)
 
         assert "radiationAxes" in output["data/2"]
         assert source.attrs["axisEdgePaths"].size == 2
+
+
+def test_particles_push_hook_is_centered_and_excludes_later_jumps(tmp_path):
+    gamma = 35.0
+    species = _species(
+        [0.3, -0.1, math.sqrt(gamma**2 - 1.0 - 0.3**2 - 0.1**2)],
+        [0.9e11, -0.2e11, 0.3e11], [0.0, 0.5e11, 0.0],
+    )
+    _activate(species)
+    diagnostic = _diagnostic(tmp_path, species, channels=["accounting"])
+    accumulator = diagnostic.accumulators["electrons"]
+
+    lower = np.array([
+        species.ux[0], species.uy[0], species.uz[0]])
+    Particles.push_p(species, 0.5 * species.dt)
+    upper = np.array([
+        species.ux[0], species.uy[0], species.uz[0]])
+    oracle = _impulse_oracle(lower, upper, species.dt)
+    expected = species.w[0] * oracle["p_perp"] * oracle["dt_observer"]
+    assert accumulator.accounting["transverse_energy"][0] == pytest.approx(
+        expected, rel=8.0e-13)
+    assert accumulator.completed_event_count == 1
+    assert accumulator.cumulative_timing["last_event_center"] == 0.0
+
+    # A discrete process after the push must not be folded into this event.
+    recorded = float(accumulator.accounting["transverse_energy"][0])
+    species.ux += 5.0
+    species.inv_gamma[:] = 1.0 / np.sqrt(
+        1.0 + species.ux**2 + species.uy**2 + species.uz**2)
+    assert accumulator.accounting["transverse_energy"][0] == recorded
+
+
+def test_nonfinite_impulse_is_counted_and_never_accumulated(tmp_path):
+    gamma = 30.0
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [0.0, 0.0, 0.0], [0.0, 0.0, 0.0])
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species, channels=["accounting"])
+    accumulator = diagnostic.accumulators["electrons"]
+
+    lower = radiator.begin_momentum_push()
+    species.ux[0] = np.nan
+    radiator.end_momentum_push(lower, 0.0)
+    assert accumulator.completed_event_count == 1
+    assert accumulator.sampling["invalid_pusher_events"][0] == 1
+    assert accumulator.accounting["transverse_energy"][0] == 0.0
+    assert accumulator.accounting["longitudinal_energy"][0] == 0.0
+    assert all(np.isfinite(value[0]) for value in accumulator.quality.values())
+
+
+def test_empty_population_records_interval_and_new_particle_waits_for_push(
+        tmp_path):
+    gamma = 30.0
+    momentum = np.array([
+        0.0, 0.0, math.sqrt(gamma**2 - 1.0)])
+    species = _species(
+        momentum, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0], count=0)
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species, channels=["accounting"])
+    accumulator = diagnostic.accumulators["electrons"]
+
+    empty_lower = radiator.begin_momentum_push()
+    assert empty_lower is not None
+    assert all(component.size == 0 for component in empty_lower)
+    radiator.end_momentum_push(empty_lower, 0.0)
+    assert accumulator.completed_event_count == 1
+    assert accumulator.accounting["transverse_energy"][0] == 0.0
+
+    # Simulate creation after that interval. Merely adding the particle does
+    # not radiate; only its next explicitly bracketed pusher impulse does.
+    species.Ntot = 1
+    species.x = np.array([0.0])
+    species.y = np.array([0.0])
+    species.z = np.array([0.0])
+    species.ux = np.array([momentum[0]])
+    species.uy = np.array([momentum[1]])
+    species.uz = np.array([momentum[2]])
+    species.w = np.array([1.0])
+    lower = radiator.begin_momentum_push()
+    assert accumulator.accounting["transverse_energy"][0] == 0.0
+    species.ux += 0.02
+    radiator.end_momentum_push(lower, species.dt)
+    assert accumulator.completed_event_count == 2
+    assert accumulator.accounting["transverse_energy"][0] > 0.0
+
+
+def test_stateless_packets_ignore_batching_and_particle_sorting(tmp_path):
+    count = 257
+    gamma = 60.0
+    u = np.array([0.2, -0.1, math.sqrt(
+        gamma**2 - 1.0 - 0.2**2 - 0.1**2)])
+    positions = np.zeros((count, 3))
+    positions[:, 0] = np.linspace(-3.0e-6, 3.0e-6, count)
+
+    def run(name, batch_size, order):
+        ordered_positions = positions[order]
+        local_count = len(order)
+        species = _species(
+            u, [0.8e11, -0.1e11, 0.2e11], [0.0, 0.7e11, 0.0],
+            count=local_count, positions=ordered_positions,
+        )
+        radiator = _activate(species)
+        diagnostic = _diagnostic(
+            tmp_path / name, species,
+            photon_energy_edges=np.array([0.0, 1.0e-16, 1.0e-14]),
+            theta_x_edges=np.array([-0.2, -0.01, 0.01, 0.2]),
+            theta_y_edges=np.array([-0.2, -0.01, 0.01, 0.2]),
+            samples_per_particle=3,
+            particle_batch_size=batch_size,
+            random_seed=7341,
+        )
+        _complete_impulse(radiator, species, 0.0)
+        accumulator = diagnostic.accumulators["electrons"]
+        return (
+            accumulator.data["angular_spectral"].copy(),
+            float(accumulator.accounting["transverse_energy"][0]),
+        )
+
+    identity = np.arange(count)
+    reverse = identity[::-1]
+    reference, reference_energy = run("reference", count, identity)
+    batched, batched_energy = run("batched", 7, identity)
+    sorted_result, sorted_energy = run("sorted", 13, reverse)
+    split = count // 2
+    first_partition, first_energy = run(
+        "partition_0", 11, identity[:split])
+    second_partition, second_energy = run(
+        "partition_1", 17, identity[split:])
+    partitioned = first_partition + second_partition
+    partitioned_energy = first_energy + second_energy
+    assert batched == pytest.approx(reference, rel=2.0e-15, abs=0.0)
+    assert sorted_result == pytest.approx(reference, rel=2.0e-15, abs=0.0)
+    # The packet realization is identical; the final two-rank-style sum
+    # differs only by ordinary floating-point reduction order.
+    assert partitioned == pytest.approx(reference, rel=2.0e-14, abs=0.0)
+    assert batched_energy == pytest.approx(reference_energy, rel=2.0e-15)
+    assert sorted_energy == pytest.approx(reference_energy, rel=2.0e-15)
+    assert partitioned_energy == pytest.approx(
+        reference_energy, rel=2.0e-14)
+
+
+@pytest.mark.skipif(not cuda_installed, reason="CUDA is not available")
+def test_stateless_packets_match_for_identical_cpu_and_gpu_events():
+    import cupy
+
+    count = 129
+    positions = np.zeros((count, 3))
+    positions[:, 0] = np.linspace(-4.0e-6, 4.0e-6, count)
+    lower_u = np.array([0.2, -0.1, math.sqrt(45.0**2 - 1.05)])
+
+    def run(use_cuda):
+        species = _species(
+            lower_u, [0.0, 0.0, 0.0], [0.0, 0.0, 0.0],
+            count=count, positions=positions)
+        species.use_cuda = use_cuda
+        if use_cuda:
+            for name in (
+                    "x", "y", "z", "ux", "uy", "uz", "inv_gamma",
+                    "w"):
+                setattr(species, name, cupy.asarray(getattr(species, name)))
+        radiator = _activate(species)
+        accumulator = radiator.configure_observer_diagnostic(
+            observer_frame="simulation",
+            enabled_channels=["angular_spectral"],
+            photon_energy_edges=np.array([0.0, 1.0e-17, 1.0e-14]),
+            theta_x_edges=np.array([-0.2, -0.01, 0.01, 0.2]),
+            theta_y_edges=np.array([-0.2, -0.01, 0.01, 0.2]),
+            samples_per_particle=3, particle_batch_size=19,
+            random_seed=8091,
+        )
+        lower = radiator.begin_momentum_push()
+        species.ux += 0.03
+        species.uy -= 0.02
+        radiator.end_momentum_push(lower, 0.0)
+        radiator.receive_from_gpu()
+        return accumulator.data["angular_spectral"].copy()
+
+    cpu = run(False)
+    gpu = run(True)
+    assert np.array_equal(cpu > 0.0, gpu > 0.0)
+    assert gpu == pytest.approx(cpu, rel=3.0e-13, abs=0.0)
+
+
+def test_diagnostic_thinning_uses_unbiased_effective_weights(tmp_path):
+    count = 1000
+    probability = 0.2
+    gamma = 30.0
+    u = np.array([0.0, 0.0, math.sqrt(gamma**2 - 1.0)])
+    positions = np.zeros((count, 3))
+    positions[:, 0] = np.linspace(-2.0e-6, 2.0e-6, count)
+
+    def run(name, fraction):
+        species = _species(
+            u, [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+            count=count, positions=positions,
+        )
+        radiator = _activate(species)
+        diagnostic = _diagnostic(
+            tmp_path / name, species, channels=["accounting"],
+            particle_sampling_fraction=fraction, random_seed=919,
+            particle_batch_size=31,
+        )
+        _complete_impulse(radiator, species, 0.0)
+        return diagnostic.accumulators["electrons"]
+
+    full = run("full", 1.0)
+    thinned = run("thin", probability)
+    sampled = thinned.sampling["sampled_macroparticle_events"][0]
+    full_energy = full.accounting["transverse_energy"][0]
+    expected_thinned = full_energy * sampled / (count * probability)
+    assert thinned.accounting["transverse_energy"][0] == pytest.approx(
+        expected_thinned, rel=3.0e-14)
+    assert thinned.sampling["eligible_macroparticle_events"][0] == count
+    assert thinned.sampling["effective_sampled_weight"][0] == pytest.approx(
+        sampled / probability)
+    assert thinned.sampling[
+        "transverse_energy_sampling_variance"][0] > 0.0
+
+
+def test_source_moments_remain_stable_at_large_coordinate_offset(tmp_path):
+    offsets = np.array([-2.0, -1.0, 1.0, 2.0]) * 1.0e-3
+    positions = np.zeros((offsets.size, 3))
+    positions[:, 0] = 1.0e12 + offsets
+    gamma = 25.0
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+        count=offsets.size, positions=positions,
+    )
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species,
+        source_moments=[{
+            "name": "stable", "quantities": "position",
+        }],
+        particle_batch_size=2,
+    )
+    _complete_impulse(radiator, species, 0.0)
+    stats = diagnostic.accumulators[
+        "electrons"].moment_stats["stable"]
+    components = source_moment_components(stats, ("position",))
+    actual_x = positions[:, 0]
+    expected_mean = actual_x[0] + np.mean(actual_x - actual_x[0])
+    expected_rms = np.sqrt(np.mean((actual_x - expected_mean)**2))
+    assert components["centroid_x"][0] == pytest.approx(expected_mean)
+    assert components["rms_x"][0] == pytest.approx(
+        expected_rms, rel=2.0e-14, abs=0.0)
+    assert components["rms_x"][0] > 0.0
+
+
+def test_dense_product_allocation_limit_is_enforced_and_exposed(tmp_path):
+    gamma = 20.0
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+    )
+    radiator = _activate(species)
+    edges = np.linspace(-1.0, 1.0, 2001)
+    with pytest.raises(MemoryError, match="Breakdown"):
+        _diagnostic(
+            tmp_path / "limited", species,
+            source_coordinate_edges={"x": edges, "y": edges},
+            source_projections=[{"name": "xy", "axes": ("x", "y")}],
+            max_allocation_bytes=1024 * 1024,
+        )
+    assert radiator.observer_accumulator is None
+
+    diagnostic = _diagnostic(
+        tmp_path / "small", species,
+        source_coordinate_edges={
+            "x": np.array([-1.0, 0.0, 1.0]),
+        },
+        source_projections=[{"name": "x", "axes": ("x",)}],
+        max_allocation_bytes=1024,
+    )
+    accumulator = diagnostic.accumulators["electrons"]
+    assert accumulator.estimated_dense_product_bytes == 16
+    assert accumulator.allocation_breakdown["source/x"] == 16
+
+
+def test_detector_referenced_source_time_is_deterministic(tmp_path):
+    gamma = 32.0
+    position = np.array([0.4e-6, -0.2e-6, 0.7e-6])
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [0.8e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+        positions=position,
+    )
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species,
+        observer_time_edges=np.array([-2.0e-12, 0.0, 2.0e-12]),
+        detectors=[{"name": "D", "direction": [0.0, 0.0, 1.0]}],
+        source_projections=[{
+            "name": "detector_time", "axes": ("time",),
+            "time_reference": "D",
+        }],
+        source_moments=[{
+            "name": "detector", "quantities": ("position", "time"),
+            "time_reference": "D",
+        }],
+    )
+    accumulator = diagnostic.accumulators["electrons"]
+    assert not accumulator.needs_spectral_samples
+    lower = _complete_impulse(radiator, species, 0.0)
+    event = accumulator._observer_event(
+        species, lower, 0.0, np, slice(None))
+    expected_tau = event["time"][0] - event["z"][0] / c
+    components = source_moment_components(
+        accumulator.moment_stats["detector"], ("position", "time"))
+    assert components["centroid_observer_time"][0] == pytest.approx(
+        expected_tau)
+    assert accumulator.data["source/detector_time"].sum() > 0.0
+
+    diagnostic.write_hdf5(1)
+    with h5py.File(
+            tmp_path / "hdf5" / "data00000001.h5", "r") as output:
+        fields = output["data/1/fields"]
+        record = next(
+            fields[name] for name in fields
+            if "Source_detector_time" in name)
+        assert _attribute_text(record.attrs["sourceTimeReference"]) == "D"
+        assert "tau_D" in _attribute_text(
+            record.attrs["observerTimeDefinition"])
+
+
+def test_joint_band_is_angle_conditioned_and_fast_mode_is_explicit(tmp_path):
+    gamma = 55.0
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+    )
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path / "joint", species,
+        observer_time_edges=np.array([-1.0e-12, 1.0e-12]),
+        detectors=[{
+            "name": "D", "direction": [0.0, 0.0, 1.0],
+            "energy_bands": [{"name": "low", "energy_range": (0.0, 1.0)}],
+        }],
+    )
+    accumulator = diagnostic.accumulators["electrons"]
+    lower = _complete_impulse(radiator, species, 0.0)
+    event = accumulator._observer_event(
+        species, lower, 0.0, np, slice(None))
+    cutoff = 0.2 * hbar * event["omega_c"][0]
+    axis = np.array([0.0, 0.0, 1.0])
+    off_plane = np.array([0.0, 0.03, 1.0])
+    off_plane /= np.linalg.norm(off_plane)
+    axis_fraction = accumulator._joint_band_fraction(
+        axis, event, (0.0, cutoff), np)[0]
+    off_plane_fraction = accumulator._joint_band_fraction(
+        off_plane, event, (0.0, cutoff), np)[0]
+    assert off_plane_fraction > axis_fraction
+
+    fast_species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+    )
+    fast_radiator = _activate(fast_species)
+    fast_diagnostic = _diagnostic(
+        tmp_path / "fast", fast_species,
+        observer_time_edges=np.array([-1.0e-12, 1.0e-12]),
+        energy_band_mode="separable",
+        detectors=[{
+            "name": "D", "direction": [0.0, 0.0, 1.0],
+            "energy_bands": [{"name": "low", "energy_range": (0.0, cutoff)}],
+        }],
+    )
+    assert fast_diagnostic.accumulators[
+        "electrons"].detectors[0]["energy_band_mode"] == "separable"
+    _complete_impulse(fast_radiator, fast_species, 0.0)
+    fast_diagnostic.write_hdf5(1)
+    with h5py.File(
+            tmp_path / "fast" / "hdf5" / "data00000001.h5", "r") as output:
+        fields = output["data/1/fields"]
+        record = next(
+            fields[name] for name in fields
+            if "ObserverTime_D_band_low_direction" in name)
+        assert record.attrs["bandEnergyAngleCouplingRetained"] == 0
+        assert "explicit_fast" in _attribute_text(
+            record.attrs["bandClosureScope"])
+
+
+def test_off_cadence_final_flush_writes_current_event(tmp_path):
+    gamma = 28.0
+    species = _species(
+        [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
+        [1.0e11, 0.0, 0.0], [0.0, 0.0, 0.0],
+    )
+    radiator = _activate(species)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=10, species={"electrons": species},
+        comm=SimpleNamespace(rank=0, size=1),
+        write_dir=str(tmp_path), channels=["accounting"],
+    )
+    _complete_impulse(radiator, species, species.dt)
+    diagnostic.write(1)
+    assert not (tmp_path / "hdf5" / "data00000001.h5").exists()
+    assert diagnostic.observer_writer.has_unwritten_events()
+    diagnostic.flush(1)
+    assert not diagnostic.observer_writer.has_unwritten_events()
+
+    with h5py.File(
+            tmp_path / "hdf5" / "data00000001.h5", "r") as output:
+        iteration = output["data/1"]
+        assert iteration.attrs["radiationFinalFlush"] == 1
+        fields = iteration["fields"]
+        record = next(iter(fields.values()))
+        assert record.attrs["finalFlush"] == 1
+        assert record.attrs["representedEventCount"] == 1
+        assert record.attrs[
+            "lastEventCenterTimeSimulation"] == species.dt
+
+
+def test_simulation_post_impulse_phase_and_resumed_steps_do_not_collide(
+        tmp_path):
+    dt = 0.5e-6 / c
+    simulation = Simulation(
+        8, 8.0e-6, 2, 2.0e-6, 1, dt, zmin=0.0,
+        boundaries={"z": "periodic", "r": "reflective"},
+        verbose_level=0,
+    )
+    species = simulation.add_new_species(
+        -e, m_e, n=1.0e18, p_nz=1, p_nr=1, p_nt=1,
+        p_rmax=1.5e-6, uz_m=12.0, continuous_injection=False,
+    )
+    species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=2, species={"electrons": species},
+        comm=simulation.comm, write_dir=str(tmp_path),
+        channels=["accounting"],
+    )
+    simulation.diags = [diagnostic]
+
+    simulation.step(2, show_progress=False)
+    assert simulation.iteration == 2
+    assert diagnostic.accumulators[
+        "electrons"].completed_event_count == 2
+    assert (tmp_path / "hdf5" / "data00000000.h5").exists()
+    # Iteration 1 is an off-cadence final flush centered on event 1.
+    assert (tmp_path / "hdf5" / "data00000001.h5").exists()
+
+    # Resuming starts with event center 2. Its scheduled output has a distinct
+    # iteration and must not collide with the preceding final flush.
+    simulation.step(1, show_progress=False)
+    assert simulation.iteration == 3
+    assert diagnostic.accumulators[
+        "electrons"].completed_event_count == 3
+    assert (tmp_path / "hdf5" / "data00000002.h5").exists()

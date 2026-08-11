@@ -295,7 +295,6 @@ class Particles(object) :
             # Copy the spin tracking data
             if self.spin_tracker is not None:
                 self.spin_tracker.send_to_gpu()
-
             # Modify flag accordingly
             self.data_is_on_gpu = True
 
@@ -340,7 +339,6 @@ class Particles(object) :
             # Copy the spin tracking data
             if self.spin_tracker is not None:
                 self.spin_tracker.receive_from_gpu()
-
             # Modify flag accordingly
             self.data_is_on_gpu = False
 
@@ -484,7 +482,9 @@ class Particles(object) :
         -----
         Product grids, detectors, source projections, and output cadence are
         configured by :class:`SynchrotronRadiationDiagnostic`. This
-        diagnostic is passive and never modifies particle momentum.
+        diagnostic forms each event from completed momentum-push endpoints
+        at the integer-time particle position. It is passive and never
+        modifies particle momentum.
         """
         self.synchrotron_radiator = SynchrotronRadiator(
             self, gamma_cutoff, x_max, n_samples, boost
@@ -632,9 +632,6 @@ class Particles(object) :
         # Ionization
         if self.ionizer is not None:
             self.ionizer.handle_ionization( self )
-        # Synchrotron radiation
-        if self.synchrotron_radiator is not None:
-            self.synchrotron_radiator.handle_radiation(t)
         # Compton scattering
         if self.compton_scatterer is not None:
             self.compton_scatterer.handle_scattering( self, t )
@@ -721,6 +718,15 @@ class Particles(object) :
         else:
             z_plane = None
 
+        # Capture the lower endpoint of the pusher impulse. The position is
+        # still at the integer-time center of this push. This capture is
+        # intentionally after all early validation and before the first
+        # in-place momentum update.
+        radiation_lower_momentum = None
+        if self.synchrotron_radiator is not None:
+            radiation_lower_momentum = \
+                self.synchrotron_radiator.begin_momentum_push()
+
         # GPU (CUDA) version
         if self.use_cuda:
             # Get the threads per block and the blocks per grid
@@ -773,6 +779,13 @@ class Particles(object) :
                 push_p_numba(self.ux, self.uy, self.uz, self.inv_gamma,
                     self.Ex, self.Ey, self.Ez, self.Bx, self.By, self.Bz,
                     self.q, self.m, self.Ntot, self.dt )
+
+        # The upper momentum endpoint is now complete while position is still
+        # at integer time. The PIC loop passes the upper half-step time, so the
+        # centered event time is one half timestep earlier.
+        if self.synchrotron_radiator is not None:
+            self.synchrotron_radiator.end_momentum_push(
+                radiation_lower_momentum, t - 0.5*self.dt)
 
 
     def push_x( self, dt, x_push=1., y_push=1., z_push=1. ) :

@@ -5,15 +5,18 @@
 - Add a fast, passive observer-frame betatron synchrotron-radiation
   diagnostic with independent angular-spectral, observer-time, source,
   source-moment, and energy-accounting channels on CPU, GPU, and MPI.
-- Reconstruct boosted emission position, time, momentum, fields, and the
-  particle worldline interval in one observer frame; keep longitudinal power
-  separate from the curvature spectrum.
+- Form each radiation event from the completed, integer-centered particle
+  pusher impulse and transform spacetime, four-velocity, four-acceleration,
+  and proper-time weight covariantly into one observer frame.
+- Keep longitudinal power separate from the curvature spectrum; retain
+  deterministic Lienard pulses, angle-conditioned energy bands, source
+  projections and moments, interval accounting, and final-event flushing.
 - Replace the maximal three-axis histogram with independently selectable
   observer products and remove its energy-bin-scaled kernels.
-- Validate lepton species and forward projected-angle charts, use a stable
-  ultrarelativistic angular denominator, report the finite spectral tail, and
-  label separable band-detector and direction-conditioned source-time
-  closures explicitly.
+- Validate lepton species and forward projected-angle charts, use stable
+  ultrarelativistic formulas and mergeable centered moments, report the finite
+  spectral tail, expose allocation costs, and support stateless reproducible
+  photon packets plus unbiased diagnostic-only particle thinning.
 
 ## 0.26.0
 

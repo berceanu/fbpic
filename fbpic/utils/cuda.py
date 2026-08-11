@@ -120,6 +120,12 @@ def send_data_to_gpu(simulation):
     for species in simulation.ptcl :
         if species.use_cuda:
             species.send_particles_to_gpu()
+            # Radiation products are simulation-level diagnostic state. Keep
+            # them out of ordinary ParticleDiagnostic transfers, which may
+            # occur frequently, and move them only with the full simulation.
+            radiator = getattr(species, "synchrotron_radiator", None)
+            if radiator is not None:
+                radiator.send_to_gpu()
     # Send fields to the GPU (if CUDA is used)
     simulation.fld.send_fields_to_gpu()
 
@@ -139,6 +145,9 @@ def receive_data_from_gpu(simulation):
     for species in simulation.ptcl :
         if species.use_cuda:
             species.receive_particles_from_gpu()
+            radiator = getattr(species, "synchrotron_radiator", None)
+            if radiator is not None:
+                radiator.receive_from_gpu()
     # Receive fields from the GPU (if CUDA is used)
     simulation.fld.receive_fields_from_gpu()
 

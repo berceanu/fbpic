@@ -46,16 +46,19 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         Density measure for products containing both angular axes.
     detectors : sequence of dicts, optional
         Fixed directions or circular apertures with observer-time edges and
-        optional energy bands.
+        optional energy bands. A detector may override energy_band_mode.
     observer_time_edges : array-like, optional
         Default detector and source observer-time edges in seconds.
     source_coordinate_edges : dict, optional
         Bin edges for any of ``x``, ``y``, and ``z``.
     source_projections : sequence, optional
         Source-distribution projections over available position, angle,
-        photon-energy, and time axes.
+        photon-energy, and time axes. Dictionaries containing a time axis may
+        set time_reference to photon_direction (the default) or a configured
+        detector name.
     source_moments : sequence, optional
-        Named radiation selections for additive source sufficient statistics.
+        Named radiation selections for mergeable source statistics. Each may
+        use the same photon-direction or detector time_reference convention.
     channels : sequence or dict, optional
         Any of ``angular_spectral``, ``observer_time``, ``source``,
         ``source_moments``, and ``accounting``. They are inferred when
@@ -73,6 +76,18 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
     gamma_cutoff : float, optional
         Diagnostic-specific observer-frame threshold. Defaults to the value
         supplied at species activation and must be greater than one.
+    energy_band_mode : {'joint', 'separable'}
+        Default energy-band detector closure. Joint retains the local photon
+        energy/emission-angle correlation; separable is the explicitly
+        labeled fast approximation.
+    random_seed : int
+        Seed for stateless physical-event packet sampling.
+    particle_sampling_fraction : float
+        Diagnostic-only Bernoulli sampling probability. Retained particle
+        weights are divided by this probability, preserving every linear
+        incoherent observable in expectation.
+    max_allocation_bytes : int or None
+        Maximum aggregate allocation for dense detector/source products.
     """
 
     def __init__(
@@ -86,7 +101,9 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             source_projections=None, source_moments=None, channels=None,
             output_mode="cumulative", samples_per_particle=1,
             particle_batch_size=262144, particle_selection=None,
-            gamma_cutoff=None):
+            gamma_cutoff=None, energy_band_mode="joint", random_seed=0,
+            particle_sampling_fraction=1.0,
+            max_allocation_bytes=1073741824):
         if not species:
             raise ValueError(
                 "`SynchrotronRadiationDiagnostic` requires at least one "
@@ -164,6 +181,10 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
                 "samples_per_particle": samples_per_particle,
                 "particle_batch_size": particle_batch_size,
                 "particle_selection": particle_selection,
+                "energy_band_mode": energy_band_mode,
+                "random_seed": random_seed,
+                "particle_sampling_fraction": particle_sampling_fraction,
+                "max_allocation_bytes": max_allocation_bytes,
             }
             if gamma_cutoff is not None:
                 configuration["gamma_cutoff"] = gamma_cutoff
@@ -179,7 +200,15 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             dt_period=dt_period, dt_sim=self.dt_sim,
         )
         self.observer_writer = ObserverRadiationWriter(self, output_mode)
+        # Leave established diagnostics at their pre-push phase; the PIC loop
+        # schedules this diagnostic only after a completed pusher impulse.
+        self.write_after_momentum_push = True
 
     def write_hdf5(self, iteration):
         """Reduce and write every configured observer-frame product."""
         self.observer_writer.write(iteration)
+
+    def flush(self, iteration):
+        """Write a final off-cadence snapshot when completed events are dirty."""
+        if self.observer_writer.has_unwritten_events():
+            self.observer_writer.write(iteration, final_flush=True)

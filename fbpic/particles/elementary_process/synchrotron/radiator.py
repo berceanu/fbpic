@@ -157,11 +157,45 @@ class SynchrotronRadiator(object):
         return self.observer_accumulator
 
     @catch_gpu_memory_error
-    def handle_radiation(self, simulation_time=0.0):
-        """Accumulate the configured passive products for one PIC event."""
-        if self.eon.Ntot == 0 or self.observer_accumulator is None:
+    def begin_momentum_push(self):
+        """Capture the lower endpoint of a diagnostic pusher impulse.
+
+        Only the three dimensionless momentum components are copied. The
+        upper endpoint and the integer-time source position are consumed
+        immediately after the pusher returns, before any elementary process
+        can create particles or introduce a separate momentum jump.
+        """
+        if self.observer_accumulator is None:
+            return None
+        # Empty local ranks still record the completed pusher interval. This
+        # keeps represented-event timing consistent under MPI repartitioning
+        # and lets newly created particles start only with the next interval.
+        return (
+            self.eon.ux.copy(),
+            self.eon.uy.copy(),
+            self.eon.uz.copy(),
+        )
+
+    @catch_gpu_memory_error
+    def end_momentum_push(self, lower_momentum, simulation_time):
+        """Accumulate one completed, integer-centered pusher impulse."""
+        if lower_momentum is None or self.observer_accumulator is None:
             return
-        self.observer_accumulator.accumulate(simulation_time)
+        self.observer_accumulator.accumulate_impulse(
+            lower_momentum, float(simulation_time))
+
+    def handle_radiation(self, simulation_time=0.0):
+        """Reject the former mixed-time gathered-field event entry point.
+
+        Radiation is now accumulated automatically around Particles.push_p.
+        Keeping this method with an explicit error makes stale integrations
+        fail loudly instead of silently reverting to the old field-derived
+        acceleration model.
+        """
+        raise RuntimeError(
+            "Synchrotron radiation is accumulated from completed momentum "
+            "pushes; handle_radiation no longer accepts gathered-field "
+            "events.")
 
     def send_to_gpu(self):
         """Move configured accumulator state to the particle backend."""
