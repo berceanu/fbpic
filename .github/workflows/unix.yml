@@ -5,9 +5,11 @@ on: [push, pull_request]
 jobs:
   test:
     strategy:
+      fail-fast: false
       matrix:
         python-version: [3.11]
         os: [ubuntu-22.04]
+        test_shard: [0, 1, 2, 3]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -38,17 +40,33 @@ jobs:
 
     - shell: bash -eo pipefail -l {0}
       name: pyflakes
+      if: matrix.test_shard == 0
       run: python -m pyflakes .
 
     - shell: bash -eo pipefail -l {0}
-      name: FBPIC physics tests
+      name: FBPIC physics tests (shard ${{ matrix.test_shard }})
+      env:
+        TEST_SHARD: ${{ matrix.test_shard }}
+        TEST_SHARD_COUNT: 4
       run: |
         export NUMBA_THREADING_LAYER=omp
+        export NUMBA_NUM_THREADS=2
+        export OMP_NUM_THREADS=2
+        export NUMBA_DISABLE_CUDA=1
         export MKL_NUM_THREADS=2
         export OPENPMD_VERIFY_HOMOGENEOUS_EXTENTS=0
-        python -m pytest tests --ignore=tests/unautomated
+        mapfile -t test_files < <(find tests -maxdepth 1 -type f -name 'test_*.py' | sort)
+        selected=()
+        for index in "${!test_files[@]}"; do
+          if (( index % TEST_SHARD_COUNT == TEST_SHARD )); then
+            selected+=("${test_files[$index]}")
+          fi
+        done
+        printf 'Shard %s/%s: %s\n' "$TEST_SHARD" "$TEST_SHARD_COUNT" "${selected[*]}"
+        python -m pytest "${selected[@]}"
     - shell: bash -eo pipefail -l {0}
       name: PICMI test
+      if: matrix.test_shard == 0
       run: |
         pip install wget picmistandard numexpr periodictable
         cd tests/unautomated
@@ -58,6 +76,7 @@ jobs:
 
     - shell: bash -eo pipefail -l {0}
       name: PICMI boosted test
+      if: matrix.test_shard == 0
       run: |
         cd tests/unautomated
         curl https://raw.githubusercontent.com/picmi-standard/picmi/master/Examples/laser_acceleration/lpa_boostedframe_PICMI.py -o fbpic_script.py

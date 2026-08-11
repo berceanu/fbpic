@@ -1,94 +1,126 @@
 # Copyright 2023, FBPIC contributors
 # Authors: Igor A Andriyash, Remi Lehe, Manuel Kirchen
 # License: 3-Clause-BSD-LBNL
-"""
-This file is part of the Fourier-Bessel Particle-In-Cell code (FB-PIC)
-"""
+"""Observer-frame synchrotron-radiation activation and spectral tables."""
 
-import numpy as np
-from scipy.constants import m_e, c, e, epsilon_0, hbar
-from scipy.special import kv
-from scipy.integrate import quad
-from numba.core.errors import NumbaPerformanceWarning
-from scipy.integrate import IntegrationWarning
+from functools import lru_cache
+import math
 import warnings
 
-from ..cuda_numba_utils import allocate_empty
-from .numba_methods import gather_synchrotron_numba, \
-    gather_synchrotron_numba_boosted
+import numpy as np
+from scipy.constants import e, m_e
+from scipy.integrate import IntegrationWarning, quad
+from scipy.special import gamma as gamma_function, kv
 
-warnings.simplefilter('ignore', category=NumbaPerformanceWarning)
-warnings.simplefilter('ignore', category=IntegrationWarning)
-
-# Check if CUDA is available, then import CUDA functions
-from fbpic.utils.cuda import cuda_installed
 from fbpic.utils.printing import catch_gpu_memory_error
-from fbpic.utils.random_seed import _synchrotron_random, \
-    _get_synchrotron_seed_generation
-if cuda_installed:
-    import cupy
-    from fbpic.utils.cuda import cuda_tpb_bpg_1d
-    from .cuda_methods import gather_synchrotron_cuda
-    from numba.cuda.random import create_xoroshiro128p_states
 
 
-def _get_cuda_rng_seed():
-    """Return a reproducible, high-entropy seed for CUDA angle sampling."""
-    return _synchrotron_random.randrange(0, 1 << 63)
+_SYNCHROTRON_NORMALIZATION = 9.0 * math.sqrt(3.0) / (8.0 * math.pi)
+_SOFT_SPECTRUM_COEFFICIENT = (
+    _SYNCHROTRON_NORMALIZATION
+    * 2.0**(2.0 / 3.0) * gamma_function(2.0 / 3.0)
+)
+
+
+def _spectral_profile(scaled_energy):
+    """Return the normalized classical synchrotron power profile ``S(x)``."""
+    if scaled_energy <= 0.0:
+        return 0.0
+    if scaled_energy < 1.0e-4:
+        return _SOFT_SPECTRUM_COEFFICIENT * scaled_energy**(1.0 / 3.0)
+    integral = quad(
+        lambda value: kv(5.0 / 3.0, value),
+        scaled_energy, np.inf,
+    )[0]
+    return _SYNCHROTRON_NORMALIZATION * scaled_energy * integral
+
+
+def _spectral_tail_fraction(x_max):
+    """Return the analytic-profile energy fraction above ``x_max``.
+
+    Reversing the order of the two synchrotron-profile integrals gives a
+    single, well-conditioned quadrature for the omitted tail.
+    """
+    integral = quad(
+        lambda value: (value**2 - x_max**2) * kv(5.0 / 3.0, value),
+        x_max, np.inf,
+    )[0]
+    fraction = 0.5 * _SYNCHROTRON_NORMALIZATION * integral
+    return float(np.clip(fraction, 0.0, 1.0))
+
+
+@lru_cache(maxsize=8)
+def _cached_spectral_cdf(x_max, n_samples):
+    """Build and cache a low-energy-resolving synchrotron CDF table."""
+    x_max = float(x_max)
+    n_samples = int(n_samples)
+    if not math.isfinite(x_max) or x_max <= 0.0:
+        raise ValueError("`x_max` must be a finite positive number.")
+    if n_samples < 16:
+        raise ValueError("`n_samples` must be at least 16.")
+
+    # A logarithmic positive grid resolves S(x) ~ x**(1/3) without spending
+    # most entries in the exponentially small high-energy tail. The origin
+    # remains explicit because both the profile and its CDF vanish there.
+    x_min = min(1.0e-6, x_max * 1.0e-4)
+    positive_x = np.geomspace(x_min, x_max, n_samples - 1)
+    spectral_x = np.concatenate(([0.0], positive_x))
+    profile = np.empty_like(spectral_x)
+    profile[0] = 0.0
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=IntegrationWarning)
+        profile[1:] = np.array([
+            _spectral_profile(value) for value in positive_x
+        ])
+        tail_fraction = _spectral_tail_fraction(x_max)
+
+    cdf = np.zeros_like(spectral_x)
+    cdf[1:] = np.cumsum(
+        0.5 * (profile[:-1] + profile[1:]) * np.diff(spectral_x)
+    )
+    retained_fraction = 1.0 - tail_fraction
+    if not cdf[-1] > 0.0:
+        raise RuntimeError("Could not normalize the synchrotron CDF table.")
+    # Use the exact retained integral for normalization. The unrepresented
+    # tail is intentionally not folded back into the sampled spectrum.
+    cdf *= retained_fraction / cdf[-1]
+    cdf[0] = 0.0
+    cdf[-1] = retained_fraction
+    spectral_x.setflags(write=False)
+    cdf.setflags(write=False)
+    return spectral_x, cdf, tail_fraction
 
 
 class SynchrotronRadiator(object):
-    """
-    Class for the synchrotron radiation calculation.
-    """
-    def __init__(self, radiating_species, photon_energy_axis,
-                 theta_x_axis, theta_y_axis, gamma_cutoff,
-                 radiation_reaction, x_max, nSamples, boost=None):
-        """
-        Initialize a Radiator instance
+    """Own the passive observer-frame accumulator for one lepton species."""
 
-        Parameters
-        ----------
-        radiating_species: an fbpic.Particles object
-            Its momentum arrays are modified only when
-            ``radiation_reaction=True``.
+    def __init__(self, radiating_species, gamma_cutoff=10.0, x_max=20.0,
+                 n_samples=2048, boost=None):
+        charge = getattr(radiating_species, "q", None)
+        mass = getattr(radiating_species, "m", None)
+        if charge is None or mass is None:
+            raise TypeError(
+                "Synchrotron radiation requires a species with charge and "
+                "mass attributes.")
+        if not math.isclose(abs(float(charge)), e, rel_tol=1.0e-12,
+                            abs_tol=0.0) or not math.isclose(
+                                float(mass), m_e, rel_tol=1.0e-12,
+                                abs_tol=0.0):
+            raise ValueError(
+                "The observer synchrotron diagnostic supports only "
+                "electrons and positrons (|q| = e and m = m_e).")
 
-        photon_energy_axis: tuple
-            Parameters for the photon energy axis provided as
-            `(photon_energy_min, photon_energy_max, N_photon_energy)`, where
-            `photon_energy_min` and `photon_energy_max` are floats in Joules
-            and `N_photon_energy` is integer
+        gamma_cutoff = float(gamma_cutoff)
+        if not math.isfinite(gamma_cutoff) or gamma_cutoff <= 1.0:
+            raise ValueError(
+                "`gamma_cutoff` must be greater than one; the local "
+                "synchrotron closure is relativistic.")
 
-        theta_x_axis: tuple
-            Parameters for the x-elevation angle axis provided as
-            `(theta_x_min, theta_x_max, N_theta_x)`, where `theta_x_min`
-            and `theta_x_max` are floats in (rad) and `N_theta_x` is integer
-
-        theta_y_axis: tuple
-            Parameters for the y-elevation angle axis provided as
-            `(theta_y_min, theta_y_max, N_theta_y)`, where `theta_y_min`
-            and `theta_y_max` are floats in radians and `N_theta_y` is integer
-
-        gamma_cutoff: float
-            Minimal particle gamma factor for which radiation is calculated
-
-        radiation_reaction: bool
-            Whether to consider radiation reaction on the electrons
-
-        x_max: float
-            Extent of the sampling used for the spectral profile function
-
-        nSamples: integer
-            number of sampling points for the spectral profile function
-
-        boost: a BoostConverter object or None
-            Defines the Lorentz boost from the laboratory frame to the
-            simulation frame. Output axes and radiation are in the lab frame.
-        """
-        # Register a few parameters
         self.use_cuda = radiating_species.use_cuda
         self.eon = radiating_species
         self.dt = radiating_species.dt
+        self.gamma_cutoff = gamma_cutoff
+        self.gamma_cutoff_inv = 1.0 / gamma_cutoff
         if boost is None:
             self.gamma_boost = 1.0
             self.beta_boost = 0.0
@@ -96,250 +128,47 @@ class SynchrotronRadiator(object):
             self.gamma_boost = boost.gamma0
             self.beta_boost = boost.beta0
 
-        if self.beta_boost != 0.0 and radiation_reaction:
-            raise NotImplementedError(
-                "Radiation reaction is not supported with boosted-frame "
-                "synchrotron radiation.")
-
-        self.gamma_cutoff_inv = 1. / gamma_cutoff
-        self.radiation_reaction = radiation_reaction
-
-        axes = (photon_energy_axis, theta_x_axis, theta_y_axis)
-        if any(axis is None for axis in axes) and not all(
-                axis is None for axis in axes):
-            raise ValueError(
-                "Legacy synchrotron activation requires all three axes; "
-                "omit all three when an observer-frame diagnostic will "
-                "configure the requested products.")
-        self.legacy_enabled = all(axis is not None for axis in axes)
-        if not self.legacy_enabled and radiation_reaction:
-            raise ValueError(
-                "Radiation reaction requires the legacy three-axis "
-                "synchrotron activation; observer-frame products are passive.")
+        table = _cached_spectral_cdf(float(x_max), int(n_samples))
+        self.spectral_x = table[0].copy()
+        self.spectral_cdf = table[1].copy()
+        self.spectral_truncated_fraction = table[2]
         self.observer_accumulator = None
-        if self.legacy_enabled:
-            self.omega_min = photon_energy_axis[0] / hbar
-            self.omega_max = photon_energy_axis[1] / hbar
-            self.N_omega = photon_energy_axis[2]
-
-            self.theta_x_min = theta_x_axis[0]
-            self.theta_x_max = theta_x_axis[1]
-            self.N_theta_x = theta_x_axis[2]
-
-            self.theta_y_min = theta_y_axis[0]
-            self.theta_y_max = theta_y_axis[1]
-            self.N_theta_y = theta_y_axis[2]
-
-            self.omega_ax = np.linspace(
-                self.omega_min, self.omega_max, self.N_omega)
-            self.d_omega = self.omega_ax[1] - self.omega_ax[0]
-            self.d_theta_x = (self.theta_x_max - self.theta_x_min) \
-                / (self.N_theta_x - 1)
-            self.d_theta_y = (self.theta_y_max - self.theta_y_min) \
-                / (self.N_theta_y - 1)
-            self.Larmore_factor_density = e**2 * self.dt \
-                / (6 * np.pi * epsilon_0 * c * hbar
-                   * self.d_theta_x * self.d_theta_y)
-            self.Larmore_factor_momentum = e**2 * self.dt \
-                / (6 * np.pi * epsilon_0 * m_e * c**3)
-        else:
-            self.omega_min = self.omega_max = self.d_omega = None
-            self.theta_x_min = self.theta_x_max = self.d_theta_x = None
-            self.theta_y_min = self.theta_y_max = self.d_theta_y = None
-            self.N_omega = self.N_theta_x = self.N_theta_y = 0
-            self.omega_ax = None
-            self.Larmore_factor_density = None
-            self.Larmore_factor_momentum = (
-                e**2 * self.dt / (6 * np.pi * epsilon_0 * m_e * c**3))
-
-        # Calculate sampling of the spectral profile function
-        self.initialize_S_function( x_max=x_max, nSamples=nSamples )
-
-        # Initialize radiation data
-        if self.legacy_enabled:
-            self.radiation_data = np.zeros(
-                (self.N_theta_x, self.N_theta_y, self.N_omega),
-                dtype=np.double)
-        else:
-            self.radiation_data = None
-
-        # send the radiation-relevant data to GPU
-        self.send_to_gpu()
-
-        # Process radiating particles into batches
-        self.batch_size = 10
-
-        self.rng_states_batch = None
-        self.rng_states_size = 0
-        self.rng_seed_generation = _get_synchrotron_seed_generation()
-
-    def initialize_S_function( self, x_max, nSamples ):
-        """
-        Initialize spectral profile function
-
-        Parameters
-        ----------
-        x_max: float
-            Extent of the sampling used for the spectral profile function
-
-        nSamples: integer
-            number of sampling points for the spectral profile function
-        """
-
-        k_53 = lambda x : kv(5./3, x)
-        S0 = lambda x : 9 * 3**0.5 / 8 / np.pi * x \
-                        * quad(k_53, x, np.inf)[0]
-        S0 =  np.vectorize(S0)
-        x_ax = np.linspace(0, x_max, nSamples)
-        self.S_func_data = np.empty_like(x_ax)
-        # S(x) tends to zero at the origin although its Bessel integral
-        # diverges there. Use the analytic limit and integrate only x > 0.
-        self.S_func_data[0] = 0.0
-        self.S_func_data[1:] = S0(x_ax[1:])
-        self.S_func_dx = x_ax[1] - x_ax[0]
-        self.S_func_x = x_ax
-        self.S_cdf_data = np.zeros_like(x_ax)
-        self.S_cdf_data[1:] = np.cumsum(
-            0.5 * (self.S_func_data[:-1] + self.S_func_data[1:])
-            * self.S_func_dx)
-        self.S_cdf_data /= self.S_cdf_data[-1]
 
     def configure_observer_diagnostic(self, **configuration):
-        """Configure the fast observer-frame products for this species."""
-        if self.radiation_reaction:
-            raise NotImplementedError(
-                "Observer-frame radiation products are passive and cannot "
-                "be combined with radiation reaction.")
+        """Configure the independently selectable observer products."""
         if self.observer_accumulator is not None:
             raise RuntimeError(
-                "Only one observer-frame synchrotron diagnostic may configure "
-                "a species at a time.")
+                "Only one synchrotron diagnostic may configure a species "
+                "at a time.")
         from .observer import ObserverFrameRadiationAccumulator
         configuration.setdefault("gamma_boost", self.gamma_boost)
         configuration.setdefault("beta_boost", self.beta_boost)
-        spectral_x = self.S_func_x
-        spectral_cdf = self.S_cdf_data
+        configuration.setdefault("gamma_cutoff", self.gamma_cutoff)
+        configuration.setdefault(
+            "spectral_truncated_fraction",
+            self.spectral_truncated_fraction,
+        )
         self.observer_accumulator = ObserverFrameRadiationAccumulator(
-            self.eon, self.dt, spectral_x, spectral_cdf, **configuration)
-        # Do not pay for or double-count the legacy N_energy loop when the new
-        # independently selectable products are active.
-        self.legacy_enabled = False
+            self.eon, self.dt, self.spectral_x, self.spectral_cdf,
+            **configuration
+        )
         if self.use_cuda:
             self.observer_accumulator.send_to_gpu()
         return self.observer_accumulator
 
     @catch_gpu_memory_error
-    def handle_radiation( self, simulation_time=0.0 ):
-        """
-        Handle radiation, either on CPU or GPU
-        """
-        # Short-cuts
-        eon = self.eon
-
-        # Skip this function if there are no electrons
-        if eon.Ntot == 0:
+    def handle_radiation(self, simulation_time=0.0):
+        """Accumulate the configured passive products for one PIC event."""
+        if self.eon.Ntot == 0 or self.observer_accumulator is None:
             return
+        self.observer_accumulator.accumulate(simulation_time)
 
+    def send_to_gpu(self):
+        """Move configured accumulator state to the particle backend."""
         if self.observer_accumulator is not None:
-            self.observer_accumulator.accumulate(simulation_time)
-        if not self.legacy_enabled:
-            return
+            self.observer_accumulator.send_to_gpu()
 
-        if self.use_cuda:
-            # Process particles in batches (of typically 10, 20 particles)
-            N_batch = int( eon.Ntot / self.batch_size ) + 1
-
-            # Allocate a container for spectral profiles for the
-            # particles in the batch
-            spect_batch = allocate_empty(
-                (N_batch, self.N_omega), self.use_cuda, dtype=np.double
-            )
-
-            # Preserve RNG state between timesteps, but restart the streams
-            # after an explicit call to set_random_seed.
-            seed_generation = _get_synchrotron_seed_generation()
-            if seed_generation != self.rng_seed_generation:
-                self.rng_states_batch = None
-                self.rng_states_size = 0
-                self.rng_seed_generation = seed_generation
-
-            # Reallocate only when a growing particle population requires
-            # additional batch states.
-            if N_batch > self.rng_states_size:
-                seed = _get_cuda_rng_seed()
-                self.rng_states_batch = create_xoroshiro128p_states(
-                    N_batch, seed)
-                self.rng_states_size = N_batch
-
-            # run kernel for radiation calculation
-            batch_grid_1d, batch_block_1d = cuda_tpb_bpg_1d( N_batch )
-            gather_synchrotron_cuda[ batch_grid_1d, batch_block_1d ](
-                N_batch, self.batch_size,  eon.Ntot,
-                eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
-                eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
-                self.Larmore_factor_density,
-                self.Larmore_factor_momentum,
-                self.gamma_cutoff_inv, self.radiation_reaction,
-                self.gamma_boost, self.beta_boost,
-                self.omega_ax, self.S_func_dx, self.S_func_data,
-                self.theta_x_min, self.theta_x_max, self.d_theta_x,
-                self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                spect_batch, self.rng_states_batch, self.radiation_data)
-        else:
-            # Allocate array for the single particle spectral profile
-            spect_loc = allocate_empty( (self.N_omega,), self.use_cuda,
-                                        dtype=np.double )
-
-            # radiation calculation (parallel loop over particle)
-            if self.beta_boost == 0.0:
-                gather_synchrotron_numba(
-                    eon.Ntot,
-                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
-                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
-                    self.Larmore_factor_density,
-                    self.Larmore_factor_momentum,
-                    self.gamma_cutoff_inv, self.radiation_reaction,
-                    self.omega_ax, self.S_func_dx, self.S_func_data,
-                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
-                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                    spect_loc, self.radiation_data)
-            else:
-                gather_synchrotron_numba_boosted(
-                    eon.Ntot,
-                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
-                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
-                    self.Larmore_factor_density,
-                    self.Larmore_factor_momentum,
-                    self.gamma_cutoff_inv,
-                    self.gamma_boost, self.beta_boost,
-                    self.omega_ax, self.S_func_dx, self.S_func_data,
-                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
-                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                    spect_loc, self.radiation_data)
-
-    def send_to_gpu( self ):
-        """
-        Copy relevant data to the GPU
-        """
-        if self.use_cuda:
-            if self.radiation_data is not None:
-                self.radiation_data = cupy.asarray( self.radiation_data )
-            if self.omega_ax is not None:
-                self.omega_ax = cupy.asarray( self.omega_ax )
-            self.S_func_data = cupy.asarray( self.S_func_data )
-            if self.observer_accumulator is not None:
-                self.observer_accumulator.send_to_gpu()
-
-    def receive_from_gpu( self ):
-        """
-        Receive relevant data from the GPU
-        """
-        if self.use_cuda:
-            if hasattr(self.radiation_data, 'get'):
-                self.radiation_data = self.radiation_data.get()
-            if hasattr(self.omega_ax, 'get'):
-                self.omega_ax = self.omega_ax.get()
-            if hasattr(self.S_func_data, 'get'):
-                self.S_func_data = self.S_func_data.get()
-            if self.observer_accumulator is not None:
-                self.observer_accumulator.receive_from_gpu()
+    def receive_from_gpu(self):
+        """Move configured accumulator state to the host."""
+        if self.observer_accumulator is not None:
+            self.observer_accumulator.receive_from_gpu()

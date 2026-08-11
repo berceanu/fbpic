@@ -456,58 +456,38 @@ class Particles(object) :
             laser_waist, laser_ctau, laser_initial_z0,
             ratio_w_electron_photon, boost )
 
-    def activate_synchrotron( self, photon_energy_axis=None, theta_x_axis=None,
-                              theta_y_axis=None, gamma_cutoff=10.0,
-                              radiation_reaction=False, x_max=20,
-                              nSamples=2048, boost=None ):
+    def activate_synchrotron( self, gamma_cutoff=10.0, x_max=20.0,
+                              n_samples=2048, boost=None ):
         """
-        Activate synchrotron radiation.
+        Activate passive observer-frame synchrotron radiation.
 
         Parameters
         ----------
-        photon_energy_axis: tuple
-            Parameters for the photon energy axis provided as
-            `(photon_energy_min, photon_energy_max, N_photon_energy)`, where
-            `photon_energy_min` and `photon_energy_max` are floats in Joules
-            and `N_photon_energy` is integer
-            Omit this and both angular axes when the requested bin edges and
-            output channels will be configured by
-            :class:`SynchrotronRadiationDiagnostic`.  This avoids allocating
-            the legacy maximal three-dimensional histogram.
-
-        theta_x_axis: tuple
-            Parameters for the x-elevation angle axis provided as
-            `(theta_x_min, theta_x_max, N_theta_x)`, where `theta_x_min`
-            and `theta_x_max` are floats in (rad) and `N_theta_x` is integer
-
-        theta_y_axis: tuple
-            Parameters for the y-elevation angle axis provided as
-            `(theta_y_min, theta_y_max, N_theta_y)`, where `theta_y_min`
-            and `theta_y_max` are floats in radians and `N_theta_y` is integer
-
         gamma_cutoff: float, optional
-            Minimal particle gamma factor for which radiation is calculated
-
-        radiation_reaction: bool, optional
-            Whether to consider radiation reaction on the electrons.
-            This is not supported when a nonidentity ``boost`` is supplied;
-            that combination raises ``NotImplementedError``.
+            Minimum observer-frame particle gamma. It must be greater than
+            one because the local synchrotron closure is relativistic.
 
         x_max: float, optional
-            Extent of the sampling used for the spectral profile function
+            Largest scaled photon energy `E_photon/(hbar*omega_c)` retained
+            by the tabulated spectral closure. The omitted energy fraction is
+            recorded in diagnostic metadata and energy accounting.
 
-        nSamples: integer, optional
-            number of sampling points for the spectral profile function
+        n_samples: integer, optional
+            Number of points in the cached, low-energy-resolving spectral CDF.
 
         boost: a BoostConverter object or None, optional
             Defines the Lorentz boost from the laboratory frame to the
-            simulation frame. The energy and angular axes, ``gamma_cutoff``,
-            and accumulated radiation are interpreted in the lab frame.
+            simulation frame. Observer products default to the laboratory
+            frame and can override this transform explicitly.
 
+        Notes
+        -----
+        Product grids, detectors, source projections, and output cadence are
+        configured by :class:`SynchrotronRadiationDiagnostic`. This
+        diagnostic is passive and never modifies particle momentum.
         """
         self.synchrotron_radiator = SynchrotronRadiator(
-            self, photon_energy_axis, theta_x_axis, theta_y_axis,
-            gamma_cutoff, radiation_reaction, x_max, nSamples, boost
+            self, gamma_cutoff, x_max, n_samples, boost
         )
 
     def make_ionizable(self, element, target_species,

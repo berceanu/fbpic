@@ -62,6 +62,21 @@ def _triangle_solid_angle(a, b, d):
 
 def angular_cell_measure(theta_x_edges, theta_y_edges, measure):
     """Return dtheta_x dtheta_y or exact spherical quadrilateral areas."""
+    theta_x_edges = np.asarray(theta_x_edges, dtype=np.float64)
+    theta_y_edges = np.asarray(theta_y_edges, dtype=np.float64)
+    limit = 0.5 * math.pi
+    for name, edges in (
+            ("theta_x_edges", theta_x_edges),
+            ("theta_y_edges", theta_y_edges)):
+        if (edges.ndim != 1 or edges.size < 2
+                or not np.all(np.isfinite(edges))
+                or not np.all(np.diff(edges) > 0.0)
+                or edges[0] <= -limit or edges[-1] >= limit):
+            raise ValueError(
+                "`%s` must be strictly increasing and lie inside "
+                "(-pi/2, pi/2)." % name)
+    if measure not in ("solid_angle", "projected_angles"):
+        raise ValueError("Unknown angular cell measure `%s`." % measure)
     if measure == "projected_angles":
         return np.diff(theta_x_edges)[:, None] * np.diff(theta_y_edges)[None, :]
     output = np.empty(
@@ -83,7 +98,26 @@ def angular_cell_measure(theta_x_edges, theta_y_edges, measure):
     return output
 
 
-def _source_moment_dimensions():
+def _moment_component_selected(name, quantities):
+    """Return whether a derived component belongs to requested quantities."""
+    quantities = set(quantities)
+    if name == "energy":
+        return True
+    if "observer_time" in name:
+        needs_position = name.startswith(("covariance_", "correlation_"))
+        return "time" in quantities and (
+            not needs_position or "position" in quantities)
+    if "theta_" in name:
+        needs_position = name.startswith((
+            "covariance_x_", "covariance_y_", "covariance_z_",
+            "correlation_x_", "correlation_y_", "correlation_z_",
+        ))
+        return "angle" in quantities and (
+            not needs_position or "position" in quantities)
+    return "position" in quantities
+
+
+def _source_moment_dimensions(quantities=("position", "angle", "time")):
     dimensions = {"energy": _ENERGY_DIMENSION}
     for axis in "xyz":
         dimensions["centroid_%s" % axis] = _LENGTH_DIMENSION
@@ -121,10 +155,14 @@ def _source_moment_dimensions():
             _LENGTH_DIMENSION + _TIME_DIMENSION
         dimensions["correlation_%s_observer_time" % position_axis] = \
             _DIMENSIONLESS
-    return dimensions
+    return {
+        name: dimension for name, dimension in dimensions.items()
+        if _moment_component_selected(name, quantities)
+    }
 
 
-def source_moment_components(stats):
+def source_moment_components(
+        stats, quantities=("position", "angle", "time")):
     """Derive physical source observables from additive sufficient statistics."""
     stats = np.asarray(stats, dtype=np.float64)
     weight = stats[0]
@@ -132,7 +170,8 @@ def source_moment_components(stats):
     if not (weight > 0.0):
         empty = {
             name: (np.nan, dimension)
-            for name, dimension in _source_moment_dimensions().items()}
+            for name, dimension in _source_moment_dimensions(
+                quantities).items()}
         empty["energy"] = energy_item
         return empty
 
@@ -167,6 +206,9 @@ def source_moment_components(stats):
     minor_rms = math.sqrt(minor_variance)
     major_rms = math.sqrt(major_variance)
     major_vector = transverse_vectors[:, 1]
+    if major_vector[0] < 0.0 or (
+            major_vector[0] == 0.0 and major_vector[1] < 0.0):
+        major_vector = -major_vector
     orientation = math.atan2(major_vector[1], major_vector[0])
     ellipticity = 0.0
     if major_rms + minor_rms > 0.0:
@@ -226,7 +268,10 @@ def source_moment_components(stats):
             float(covariance_x_time[i]), _LENGTH_DIMENSION + _TIME_DIMENSION)
         output["correlation_%s_observer_time" % axis] = (
             float(correlation), _DIMENSIONLESS)
-    return output
+    return {
+        name: value for name, value in output.items()
+        if _moment_component_selected(name, quantities)
+    }
 
 
 def pulse_components(raw_energy, time_edges, per_solid_angle, interval):
@@ -340,14 +385,11 @@ class ObserverRadiationWriter(object):
         record.attrs["cumulative"] = np.uint32(mode == "cumulative")
         record.attrs["spectralModel"] = _bytes(
             "normalized_classical_synchrotron_curvature")
-        record.attrs["localAngularModel"] = _bytes(
-            accumulator.local_angular_model)
-        if accumulator.local_angular_model == "synchrotron":
-            angular_kernel = \
-                "polarization_summed_Schwinger_vertical_conditional"
-        else:
-            angular_kernel = "energy_independent_legacy_Gaussian"
-        record.attrs["spectralAngularKernel"] = _bytes(angular_kernel)
+        record.attrs["localAngularModel"] = _bytes("synchrotron")
+        record.attrs["spectralAngularKernel"] = _bytes(
+            "polarization_summed_Schwinger_vertical_conditional")
+        record.attrs["angularKernelQMaximum"] = 8.0
+        record.attrs["sampledAngleCap"] = 0.5 * math.pi
         record.attrs["samplesPerParticle"] = accumulator.samples_per_particle
         record.attrs["particleBatchSize"] = accumulator.particle_batch_size
         record.attrs["gammaThreshold"] = accumulator.gamma_cutoff
@@ -355,6 +397,10 @@ class ObserverRadiationWriter(object):
             accumulator.particle_selection,
             default=lambda value: value.tolist()))
         record.attrs["spectralClosureMaximumX"] = accumulator.spectral_x[-1]
+        record.attrs["spectralClosureTruncatedEnergyFraction"] = (
+            accumulator.spectral_truncated_fraction)
+        record.attrs["spectralClosureTailTreatment"] = _bytes(
+            "reported_as_unrepresented_energy_not_renormalized")
         record.attrs["angularMeasure"] = _bytes(accumulator.angular_measure)
         record.attrs["angularCoordinateConvention"] = _bytes(
             "theta_x=atan2(n_x,n_z);theta_y=atan2(n_y,n_z)")
@@ -364,6 +410,9 @@ class ObserverRadiationWriter(object):
             "incoherent_linear_in_weight")
         record.attrs["radiationReaction"] = np.uint32(0)
         record.attrs["passiveDiagnostic"] = np.uint32(1)
+        record.attrs["picEventTimeStaggering"] = _bytes(
+            "position_and_momentum_at_particle_half_step;"
+            "fields_from_preceding_integer_step")
         record.attrs["unitSI"] = 1.0
         record.attrs["timeOffset"] = 0.0
 
@@ -534,6 +583,9 @@ class ObserverRadiationWriter(object):
             if "time" in projection["axes"]:
                 record.attrs["observerTimeDefinition"] = _bytes(
                     "t_observer_minus_sampled_photon_direction_dot_r_over_c")
+                record.attrs["observerTimeConditioning"] = _bytes(
+                    "direction_conditioned_radiation_phase_coordinate;"
+                    "angle_marginals_mix_distinct_null_coordinates")
 
         if key.startswith("detector/"):
             detector_name = key.split("/")[1]
@@ -562,9 +614,15 @@ class ObserverRadiationWriter(object):
                     if item["name"] == band_name)
                 record.attrs["photonEnergySelection"] = band["energy_range"]
                 record.attrs["bandSpectralClosure"] = _bytes(
-                    "curvature_only_normalized_synchrotron_CDF")
+                    "curvature_only_finite_synchrotron_CDF_with_reported_tail")
                 record.attrs["bandAngularModel"] = _bytes(
                     "exact_transverse_Lienard_pattern")
+                record.attrs["bandSpectralAngularClosure"] = _bytes(
+                    "separable_transverse_Lienard_angular_pattern_times_"
+                    "angle_integrated_synchrotron_band_fraction")
+                record.attrs["bandEnergyAngleCouplingRetained"] = np.uint32(0)
+                record.attrs["bandClosureScope"] = _bytes(
+                    "approximation;not_the_joint_spectral_angular_kernel")
 
     def _write_product(self, field_group, iteration_group, accumulator,
                        species_name, mode, key, raw):
@@ -632,7 +690,11 @@ class ObserverRadiationWriter(object):
                 "longName": _bytes(
                     "observer-frame radiation energy accounting"),
                 "energyRangeAccounting": _bytes(
-                    "deterministic_integral_of_synchrotron_CDF"),
+                    "deterministic_integral_of_finite_synchrotron_CDF;"
+                    "above_range_includes_any_unrepresented_high_x_tail"),
+                "spectralTailAccounting": _bytes(
+                    "energy_truncated_by_spectral_closure_is_informational;"
+                    "it_overlaps_energy_above_range_when_that_range_is_finite"),
                 "energyRangeIncludesLongitudinalAcceleration": np.uint32(0),
                 "angularLossAccounting": _bytes(
                     "sampled_local_curvature_closure"),
@@ -646,20 +708,40 @@ class ObserverRadiationWriter(object):
         for selection_name, stats in moments.items():
             name = "radiationSourceMoments_%s_%s_%s" % (
                 _clean(selection_name), _clean(species_name), mode)
+            selection = selections[selection_name]
             selection_json = json.dumps(
-                selections[selection_name],
+                selection,
                 default=lambda value: value.tolist())
-            self._write_component_group(
-                field_group, name, source_moment_components(stats),
-                accumulator, species_name, mode,
-                {
-                    "longName": _bytes(
-                        "radiation-weighted observer-frame source moments"),
-                    "sourceMomentSelection": _bytes(selection_json),
-                    "longitudinalAccelerationIncluded": np.uint32(0),
+            attributes = {
+                "longName": _bytes(
+                    "radiation-weighted observer-frame source moments"),
+                "sourceMomentSelection": _bytes(selection_json),
+                "sourceMomentQuantities": np.array([
+                    _bytes(value) for value in selection["quantities"]]),
+                "sourceMomentAccumulation": _bytes(
+                    "deterministic_integrated_curvature_energy"
+                    if selection["deterministic"] else
+                    "sampled_local_spectral_angular_closure"),
+                "longitudinalAccelerationIncluded": np.uint32(0),
+                "transverseEllipticityDefinition": _bytes(
+                    "(sigma_major-sigma_minor)/(sigma_major+sigma_minor)"),
+                "transverseOrientationConvention": _bytes(
+                    "canonical_major_eigenvector_with_nonnegative_x;"
+                    "orientation_modulo_pi"),
+            }
+            if "time" in selection["quantities"]:
+                attributes.update({
                     "observerTimeDefinition": _bytes(
                         "t_observer_minus_sampled_photon_direction_dot_r_over_c"),
+                    "observerTimeConditioning": _bytes(
+                        "direction_conditioned_radiation_phase_coordinate;"
+                        "angle_marginals_mix_distinct_null_coordinates"),
                 })
+            self._write_component_group(
+                field_group, name, source_moment_components(
+                    stats, selection["quantities"]),
+                accumulator, species_name, mode,
+                attributes)
 
     def _write_pulse_metrics(self, field_group, accumulator, species_name,
                              mode, data):

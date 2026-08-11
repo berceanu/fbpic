@@ -2,11 +2,10 @@
 # License: 3-Clause-BSD-LBNL
 """Fast observer-frame accumulation for incoherent betatron radiation.
 
-The legacy synchrotron implementation evaluates the spectrum at every output
-energy for every macroparticle.  The accumulator in this module instead uses a
-fixed number of energy-angle samples from the local synchrotron closure.  Its
-normal per-step cost is consequently independent of the number of requested
-photon-energy bins and it never allocates an ``N_particle x N_energy`` array.
+The accumulator uses a fixed number of energy-angle samples from the local
+synchrotron closure. Its normal per-step cost is consequently independent of
+the number of requested photon-energy bins, and it never allocates an
+``N_particle x N_energy`` array.
 
 All accumulated arrays contain *integrated energy per bin*.  Conversion to a
 density with respect to the selected bin measures is deliberately left to the
@@ -15,6 +14,7 @@ openPMD writer.  This makes energy accounting independent of bin spacing.
 
 import math
 import re
+from functools import lru_cache
 
 import numpy as np
 from scipy.constants import c, e, epsilon_0, hbar, m_e
@@ -29,6 +29,7 @@ if cuda_installed:
 _POWER_FACTOR = e**2 / (6.0 * math.pi * epsilon_0 * c)
 _ANGULAR_POWER_FACTOR = e**2 / (16.0 * math.pi**2 * epsilon_0 * c)
 _E_MC = e / (m_e * c)
+_PROJECTED_ANGLE_LIMIT = 0.5 * math.pi
 
 _SOURCE_STAT_SIZE = 30
 
@@ -45,6 +46,37 @@ _RADIATION_SELECTION_RANGES = {
     "x_range": "x", "y_range": "y", "z_range": "z",
     "theta_x_range": "theta_x", "theta_y_range": "theta_y",
 }
+
+
+@lru_cache(maxsize=8)
+def _cached_angular_kernel(maximum_scaled_energy):
+    """Tabulate and cache the Schwinger vertical-angle inverse CDF."""
+    x_grid = np.geomspace(1.0e-8, maximum_scaled_energy, 96)
+    probability = np.linspace(0.0, 1.0, 257)
+    q_grid = np.linspace(0.0, 8.0, 1025)
+    inverse = np.empty((x_grid.size, probability.size), dtype=np.float64)
+    for index, scaled_energy in enumerate(x_grid):
+        x_third = scaled_energy**(1.0 / 3.0)
+        y = q_grid / x_third
+        one_plus_y2 = 1.0 + y**2
+        xi = 0.5 * scaled_energy * one_plus_y2**1.5
+        density = one_plus_y2**2 * (
+            kv(2.0 / 3.0, xi)**2
+            + y**2 / one_plus_y2 * kv(1.0 / 3.0, xi)**2
+        ) / x_third
+        density[~np.isfinite(density)] = 0.0
+        cdf = np.zeros_like(q_grid)
+        cdf[1:] = np.cumsum(
+            0.5 * (density[:-1] + density[1:]) * np.diff(q_grid))
+        if not cdf[-1] > 0.0:
+            raise RuntimeError(
+                "Could not normalize the synchrotron angular kernel.")
+        cdf /= cdf[-1]
+        inverse[index] = np.interp(probability, cdf, q_grid)
+    log_x = np.log(x_grid)
+    for array in (x_grid, log_x, probability, inverse):
+        array.setflags(write=False)
+    return x_grid, log_x, probability, inverse
 
 
 def _safe_name(value):
@@ -71,6 +103,17 @@ def _as_edges(values, name):
     return edges.copy()
 
 
+def _as_projected_angle_edges(values, name):
+    """Validate edges in the one-to-one forward projected-angle chart."""
+    edges = _as_edges(values, name)
+    if (edges[0] <= -_PROJECTED_ANGLE_LIMIT
+            or edges[-1] >= _PROJECTED_ANGLE_LIMIT):
+        raise ValueError(
+            "`%s` must lie strictly inside (-pi/2, pi/2); projected "
+            "angles represent only the forward hemisphere." % name)
+    return edges
+
+
 def _as_range(values, name, nonnegative=False):
     """Validate a selectable half-open observer-frame interval."""
     if values is None or len(values) != 2:
@@ -82,6 +125,15 @@ def _as_range(values, name, nonnegative=False):
     if nonnegative and lower < 0.0:
         raise ValueError("`%s` cannot start below zero." % name)
     return (lower, upper)
+
+
+def _as_projected_angle_range(values, name):
+    bounds = _as_range(values, name)
+    if (bounds[0] <= -_PROJECTED_ANGLE_LIMIT
+            or bounds[1] >= _PROJECTED_ANGLE_LIMIT):
+        raise ValueError(
+            "`%s` must lie strictly inside (-pi/2, pi/2)." % name)
+    return bounds
 
 
 def _unit_vector(value, name="direction"):
@@ -153,9 +205,14 @@ def _normalize_radiation_selection(selection, label):
             label, ", ".join(sorted(unknown))))
     for key in _RADIATION_SELECTION_RANGES:
         if key in normalized:
-            normalized[key] = _as_range(
-                normalized[key], "%s %s" % (label, key),
-                nonnegative=key in ("energy_range", "energy_band"))
+            range_name = "%s %s" % (label, key)
+            if key in ("theta_x_range", "theta_y_range"):
+                normalized[key] = _as_projected_angle_range(
+                    normalized[key], range_name)
+            else:
+                normalized[key] = _as_range(
+                    normalized[key], range_name,
+                    nonnegative=key in ("energy_range", "energy_band"))
     angular_key = (
         "angular_range" if "angular_range" in normalized
         else "angular_region" if "angular_region" in normalized else None)
@@ -166,8 +223,10 @@ def _normalize_radiation_selection(selection, label):
                 "`%s %s` needs theta_x and theta_y ranges."
                 % (label, angular_key))
         normalized[angular_key] = (
-            _as_range(angular_range[0], "%s theta_x" % label),
-            _as_range(angular_range[1], "%s theta_y" % label),
+            _as_projected_angle_range(
+                angular_range[0], "%s theta_x" % label),
+            _as_projected_angle_range(
+                angular_range[1], "%s theta_y" % label),
         )
     if "direction" in normalized:
         normalized["direction"] = _unit_vector(
@@ -188,8 +247,17 @@ def _normalize_detector(detector, index, common_time_edges):
     else:
         item = {"direction": detector}
     if "direction" not in item and "theta_x" in item and "theta_y" in item:
-        tangent_x = math.tan(float(item["theta_x"]))
-        tangent_y = math.tan(float(item["theta_y"]))
+        theta_x = float(item["theta_x"])
+        theta_y = float(item["theta_y"])
+        if not (-_PROJECTED_ANGLE_LIMIT < theta_x <
+                _PROJECTED_ANGLE_LIMIT) or not (
+                    -_PROJECTED_ANGLE_LIMIT < theta_y <
+                    _PROJECTED_ANGLE_LIMIT):
+            raise ValueError(
+                "Detector projected angles must lie inside "
+                "(-pi/2, pi/2).")
+        tangent_x = math.tan(theta_x)
+        tangent_y = math.tan(theta_y)
         item["direction"] = (tangent_x, tangent_y, 1.0)
     if "direction" not in item:
         raise ValueError("Every detector channel requires a `direction`.")
@@ -291,8 +359,13 @@ def _expand_moment_selections(selections):
                 child["energy_range"] = (edges[bin_index], edges[bin_index + 1])
                 expanded.append(child)
         elif angle_x_bins is not None or angle_y_bins is not None:
-            x_edges = _as_edges(angle_x_bins, "source moment theta_x_bins")
-            y_edges = _as_edges(angle_y_bins, "source moment theta_y_bins")
+            if angle_x_bins is None or angle_y_bins is None:
+                raise ValueError(
+                    "Source-moment angular bins require both theta axes.")
+            x_edges = _as_projected_angle_edges(
+                angle_x_bins, "source moment theta_x_bins")
+            y_edges = _as_projected_angle_edges(
+                angle_y_bins, "source moment theta_y_bins")
             for ix in range(x_edges.size - 1):
                 for iy in range(y_edges.size - 1):
                     child = dict(item)
@@ -313,6 +386,7 @@ class ObserverFrameRadiationAccumulator(object):
 
     def __init__(
             self, radiating_species, dt_sim, spectral_x, spectral_cdf,
+            spectral_truncated_fraction=None,
             gamma_boost=1.0, beta_boost=0.0,
             observer_frame="laboratory", observer_translation=None,
             enabled_channels=None, photon_energy_edges=None,
@@ -320,8 +394,7 @@ class ObserverFrameRadiationAccumulator(object):
             angular_measure="solid_angle", detectors=None,
             observer_time_edges=None, source_coordinate_edges=None,
             source_projections=None, source_moments=None,
-            local_angular_model="synchrotron", samples_per_particle=1,
-            gamma_cutoff=10.0, particle_selection=None,
+            samples_per_particle=1, gamma_cutoff=10.0, particle_selection=None,
             particle_batch_size=262144):
         self.eon = radiating_species
         self.use_cuda = radiating_species.use_cuda
@@ -359,41 +432,45 @@ class ObserverFrameRadiationAccumulator(object):
             raise ValueError("Synchrotron CDF and x grid have unequal shapes.")
         if (not np.all(np.isfinite(self.spectral_cdf))
                 or np.any(np.diff(self.spectral_cdf) < 0.0)
-                or self.spectral_cdf[-1] <= 0.0):
+                or self.spectral_cdf[-1] <= 0.0
+                or self.spectral_cdf[-1] > 1.0 + 2.0e-14):
             raise ValueError("The synchrotron CDF must be finite and monotonic.")
-        self.spectral_cdf /= self.spectral_cdf[-1]
         self.spectral_cdf[0] = 0.0
-        self.spectral_cdf[-1] = 1.0
+        self.spectral_cdf[-1] = min(self.spectral_cdf[-1], 1.0)
+        inferred_truncation = 1.0 - self.spectral_cdf[-1]
+        if spectral_truncated_fraction is None:
+            spectral_truncated_fraction = inferred_truncation
+        self.spectral_truncated_fraction = float(
+            spectral_truncated_fraction)
+        if (not (0.0 <= self.spectral_truncated_fraction < 1.0)
+                or not math.isclose(
+                    self.spectral_truncated_fraction, inferred_truncation,
+                    rel_tol=2.0e-12, abs_tol=2.0e-14)):
+            raise ValueError(
+                "The spectral CDF endpoint and truncated fraction disagree.")
 
         self.gamma_cutoff = float(gamma_cutoff)
-        if self.gamma_cutoff < 1.0:
-            raise ValueError("`gamma_cutoff` must be at least one.")
+        if self.gamma_cutoff <= 1.0:
+            raise ValueError("`gamma_cutoff` must be greater than one.")
         self.particle_selection = {}
         for key, bounds in dict(particle_selection or {}).items():
             if key not in _PARTICLE_SELECTION_ALIASES:
                 raise ValueError(
                     "Unsupported observer-frame particle selection `%s`."
                     % key)
-            self.particle_selection[key] = _as_range(
-                bounds, "particle_selection %s" % key,
-                nonnegative=key in ("gamma", "weight", "w"))
+            if key in ("theta_x", "theta_y"):
+                self.particle_selection[key] = _as_projected_angle_range(
+                    bounds, "particle_selection %s" % key)
+            else:
+                self.particle_selection[key] = _as_range(
+                    bounds, "particle_selection %s" % key,
+                    nonnegative=key in ("gamma", "weight", "w"))
         self.samples_per_particle = int(samples_per_particle)
         if self.samples_per_particle < 1:
             raise ValueError("`samples_per_particle` must be a positive integer.")
         self.particle_batch_size = int(particle_batch_size)
         if self.particle_batch_size < 1:
             raise ValueError("`particle_batch_size` must be a positive integer.")
-        model_aliases = {
-            "local_synchrotron": "synchrotron",
-            "acceleration_plane": "synchrotron",
-            "legacy": "legacy_gaussian",
-            "gaussian": "legacy_gaussian",
-        }
-        self.local_angular_model = model_aliases.get(
-            local_angular_model, local_angular_model)
-        if self.local_angular_model not in ("synchrotron", "legacy_gaussian"):
-            raise ValueError(
-                "Unknown local angular model `%s`." % local_angular_model)
         if angular_measure not in ("solid_angle", "projected_angles"):
             raise ValueError(
                 "`angular_measure` must be 'solid_angle' or "
@@ -445,9 +522,11 @@ class ObserverFrameRadiationAccumulator(object):
             if self.energy_edges[0] < 0.0:
                 raise ValueError("Photon-energy edges cannot be negative.")
         if theta_x_edges is not None:
-            self.theta_x_edges = _as_edges(theta_x_edges, "theta_x_edges")
+            self.theta_x_edges = _as_projected_angle_edges(
+                theta_x_edges, "theta_x_edges")
         if theta_y_edges is not None:
-            self.theta_y_edges = _as_edges(theta_y_edges, "theta_y_edges")
+            self.theta_y_edges = _as_projected_angle_edges(
+                theta_y_edges, "theta_y_edges")
         if "angular_spectral" in self.enabled_channels:
             if (self.energy_edges is None or self.theta_x_edges is None
                     or self.theta_y_edges is None):
@@ -460,6 +539,8 @@ class ObserverFrameRadiationAccumulator(object):
             self.common_time_edges = _as_edges(
                 observer_time_edges, "observer_time_edges")
         detector_values = [] if detectors is None else detectors
+        if isinstance(detector_values, dict):
+            detector_values = [detector_values]
         self.detectors = [
             _normalize_detector(detector, index, self.common_time_edges)
             for index, detector in enumerate(detector_values)
@@ -519,9 +600,25 @@ class ObserverFrameRadiationAccumulator(object):
             selection = dict(selection)
             name = _safe_name(
                 selection.pop("name", "selection_%d" % index))
+            quantities = selection.pop(
+                "quantities", ("position", "angle", "time"))
+            if isinstance(quantities, str):
+                quantities = (quantities,)
+            quantities = tuple(quantities)
+            allowed_quantities = {"position", "angle", "time"}
+            if (not quantities or len(set(quantities)) != len(quantities)
+                    or set(quantities) - allowed_quantities):
+                raise ValueError(
+                    "Source-moment quantities must be a nonempty subset of "
+                    "'position', 'angle', and 'time'.")
             selection = _normalize_radiation_selection(
                 selection, "source moment selection")
             selection["name"] = name
+            selection["quantities"] = quantities
+            selection["deterministic"] = bool(
+                set(quantities) == {"position"}
+                and set(selection) <= (
+                    {"name", "quantities"} | coordinate_selection_keys))
             normalized_selections.append(selection)
         self.source_moment_selections = normalized_selections
         _require_unique(self.source_moment_selections, "Source moment selection")
@@ -536,8 +633,7 @@ class ObserverFrameRadiationAccumulator(object):
         self.angular_kernel_log_x = None
         self.angular_kernel_probability = None
         self.angular_kernel_inverse = None
-        if (self.needs_spectral_samples
-                and self.local_angular_model == "synchrotron"):
+        if self.needs_spectral_samples:
             self._initialize_angular_kernel()
         self._runtime = self._all_runtime_arrays()
         self._on_gpu = False
@@ -558,32 +654,11 @@ class ObserverFrameRadiationAccumulator(object):
         x, so the prescribed one-dimensional synchrotron closure remains the
         exact energy marginal.
         """
-        x_grid = np.geomspace(1.e-8, self.spectral_x[-1], 96)
-        probability = np.linspace(0.0, 1.0, 257)
-        q_grid = np.linspace(0.0, 8.0, 1025)
-        inverse = np.empty((x_grid.size, probability.size), dtype=np.float64)
-        for index, scaled_energy in enumerate(x_grid):
-            x_third = scaled_energy**(1.0 / 3.0)
-            y = q_grid / x_third
-            one_plus_y2 = 1.0 + y**2
-            xi = 0.5 * scaled_energy * one_plus_y2**1.5
-            density = one_plus_y2**2 * (
-                kv(2.0 / 3.0, xi)**2
-                + y**2 / one_plus_y2 * kv(1.0 / 3.0, xi)**2
-            ) / x_third
-            density[~np.isfinite(density)] = 0.0
-            cdf = np.zeros_like(q_grid)
-            cdf[1:] = np.cumsum(
-                0.5 * (density[:-1] + density[1:]) * np.diff(q_grid))
-            if not cdf[-1] > 0.0:
-                raise RuntimeError(
-                    "Could not normalize the synchrotron angular kernel.")
-            cdf /= cdf[-1]
-            inverse[index] = np.interp(probability, cdf, q_grid)
-        self.angular_kernel_x = x_grid
-        self.angular_kernel_log_x = np.log(x_grid)
-        self.angular_kernel_probability = probability
-        self.angular_kernel_inverse = inverse
+        table = _cached_angular_kernel(float(self.spectral_x[-1]))
+        self.angular_kernel_x = table[0]
+        self.angular_kernel_log_x = table[1]
+        self.angular_kernel_probability = table[2]
+        self.angular_kernel_inverse = table[3]
 
     def _initialize_storage(self):
         if "angular_spectral" in self.enabled_channels:
@@ -648,12 +723,21 @@ class ObserverFrameRadiationAccumulator(object):
                 self.moment_stats[selection["name"]] = np.zeros(
                     _SOURCE_STAT_SIZE, dtype=np.float64)
 
-        base_accounting = (
+        base_accounting = [
             "transverse_energy", "longitudinal_energy",
-            "energy_below_range", "energy_within_range",
-            "energy_above_range",
-            "energy_outside_angular_grid", "energy_outside_apertures",
-        )
+            "energy_truncated_by_spectral_closure",
+        ]
+        if self.energy_edges is not None:
+            base_accounting.extend((
+                "energy_below_range", "energy_within_range",
+                "energy_above_range",
+            ))
+        if "angular_spectral" in self.enabled_channels:
+            base_accounting.append("energy_outside_angular_grid")
+        if self.needs_spectral_samples and any(
+                detector["half_angle"] > 0.0
+                for detector in self.detectors):
+            base_accounting.append("energy_outside_apertures")
         for name in base_accounting:
             self.accounting[name] = np.zeros(1, dtype=np.float64)
         for key, kind in self.data_kinds.items():
@@ -680,10 +764,9 @@ class ObserverFrameRadiationAccumulator(object):
             or ("source" in self.enabled_channels and any(
                 not projection["deterministic"]
                 for projection in self.source_projections))
-            or "source_moments" in self.enabled_channels
-            or ("observer_time" in self.enabled_channels and any(
-                detector["half_angle"] > 0.0
-                for detector in self.detectors))
+            or ("source_moments" in self.enabled_channels and any(
+                not selection["deterministic"]
+                for selection in self.source_moment_selections))
         )
 
     def _all_runtime_arrays(self):
@@ -756,13 +839,13 @@ class ObserverFrameRadiationAccumulator(object):
         value = cdf[index_clip] + fraction * (
             cdf[index_clip + 1] - cdf[index_clip])
         value = xp.where(scaled_energy <= x_grid[0], 0.0, value)
-        value = xp.where(scaled_energy >= x_grid[-1], 1.0, value)
-        return xp.clip(value, 0.0, 1.0)
+        value = xp.where(scaled_energy >= x_grid[-1], cdf[-1], value)
+        return xp.clip(value, 0.0, cdf[-1])
 
     def _inverse_cdf(self, probability, xp):
         x_grid = self._runtime["spectral_x"]
         cdf = self._runtime["spectral_cdf"]
-        probability = xp.clip(probability, 0.0, 1.0)
+        probability = xp.clip(probability, 0.0, cdf[-1])
         upper = xp.searchsorted(cdf, probability, side="right")
         upper = xp.clip(upper, 1, cdf.size - 1)
         lower = upper - 1
@@ -827,7 +910,11 @@ class ObserverFrameRadiationAccumulator(object):
         return mask
 
     def _observer_event(self, eon, simulation_time, xp, particle_slice=None):
-        """Transform momentum, fields, and the complete emission event."""
+        """Transform the complete PIC event tuple available to the process.
+
+        Position and momentum are at the particle half step; fields are those
+        gathered at the preceding integer step.
+        """
         if particle_slice is None:
             particle_slice = slice(None)
         gamma_sim = 1.0 / eon.inv_gamma[particle_slice]
@@ -945,9 +1032,17 @@ class ObserverFrameRadiationAccumulator(object):
         dot_beta_x = event["dot_beta%s_x" % suffix]
         dot_beta_y = event["dot_beta%s_y" % suffix]
         dot_beta_z = event["dot_beta%s_z" % suffix]
-        qx = nx - event["beta_x"]
-        qy = ny - event["beta_y"]
-        qz = nz - event["beta_z"]
+        beta_abs = event["beta_abs"]
+        safe_beta_abs = xp.where(beta_abs > 0.0, beta_abs, 1.0)
+        beta_hat_x = event["beta_x"] / safe_beta_abs
+        beta_hat_y = event["beta_y"] / safe_beta_abs
+        beta_hat_z = event["beta_z"] / safe_beta_abs
+        one_minus_beta = event["inv_gamma"]**2 / (1.0 + beta_abs)
+        # The same cancellation affects n - beta in the numerator. Express it
+        # as (n - beta_hat) + (1 - |beta|) beta_hat.
+        qx = nx - beta_hat_x + one_minus_beta * beta_hat_x
+        qy = ny - beta_hat_y + one_minus_beta * beta_hat_y
+        qz = nz - beta_hat_z + one_minus_beta * beta_hat_z
         inner_x = qy * dot_beta_z - qz * dot_beta_y
         inner_y = qz * dot_beta_x - qx * dot_beta_z
         inner_z = qx * dot_beta_y - qy * dot_beta_x
@@ -955,11 +1050,23 @@ class ObserverFrameRadiationAccumulator(object):
         outer_y = nz * inner_x - nx * inner_z
         outer_z = nx * inner_y - ny * inner_x
         numerator = outer_x**2 + outer_y**2 + outer_z**2
-        denominator = 1.0 - (
-            nx * event["beta_x"]
-            + ny * event["beta_y"]
-            + nz * event["beta_z"])
-        denominator = xp.maximum(denominator, np.finfo(np.float64).tiny)
+        # Evaluate 1 - n.beta without subtracting two nearly equal values:
+        #
+        #   1 - n.beta = (1 - |beta|)
+        #                + |beta| |n - beta_hat|^2 / 2,
+        #   1 - |beta| = gamma^-2 / (1 + |beta|).
+        #
+        # This remains accurate for an on-axis ultrarelativistic particle.
+        direction_difference2 = (
+            (nx - beta_hat_x)**2
+            + (ny - beta_hat_y)**2
+            + (nz - beta_hat_z)**2
+        )
+        denominator = (
+            one_minus_beta
+            + 0.5 * beta_abs * direction_difference2
+        )
+        denominator = xp.where(beta_abs > 0.0, denominator, 1.0)
         return _ANGULAR_POWER_FACTOR * numerator / denominator**5
 
     def _band_fraction(self, event, bounds, xp):
@@ -1041,17 +1148,6 @@ class ObserverFrameRadiationAccumulator(object):
                         "represented/%s_energy" % band_key][0] += represented
 
     def _sample_direction(self, event, scaled_energy, xp):
-        if self.local_angular_model == "legacy_gaussian":
-            width = event["inv_gamma"] / math.sqrt(8.0)
-            theta_x = event["particle_theta_x"] \
-                + width * xp.random.standard_normal(width.size)
-            theta_y = event["particle_theta_y"] \
-                + width * xp.random.standard_normal(width.size)
-            tangent_x = xp.tan(theta_x)
-            tangent_y = xp.tan(theta_y)
-            norm = xp.sqrt(1.0 + tangent_x**2 + tangent_y**2)
-            return tangent_x / norm, tangent_y / norm, 1.0 / norm
-
         projection = (
             event["beta_x"] * event["du_x"]
             + event["beta_y"] * event["du_y"]
@@ -1108,37 +1204,37 @@ class ObserverFrameRadiationAccumulator(object):
         )
 
     @staticmethod
-    def _update_moments(stats, values, weights, xp):
+    def _update_moments(stats, values, weights, quantities, xp):
         stats[0] += xp.sum(weights)
-        x, y, z = values["x"], values["y"], values["z"]
-        tx, ty = values["theta_x"], values["theta_y"]
-        tau = values["time"]
-        coordinates = (x, y, z)
-        angles = (tx, ty)
-        for i, coordinate in enumerate(coordinates):
-            stats[1 + i] += xp.sum(weights * coordinate)
-        offset = 4
-        for i, first in enumerate(coordinates):
-            for j, second in enumerate(coordinates):
-                stats[offset + 3 * i + j] += xp.sum(
-                    weights * first * second)
-        offset = 13
-        for i, angle in enumerate(angles):
-            stats[offset + i] += xp.sum(weights * angle)
-        offset = 15
-        for i, first in enumerate(angles):
-            for j, second in enumerate(angles):
-                stats[offset + 2 * i + j] += xp.sum(
-                    weights * first * second)
-        offset = 19
-        for i, coordinate in enumerate(coordinates):
-            for j, angle in enumerate(angles):
-                stats[offset + 2 * i + j] += xp.sum(
-                    weights * coordinate * angle)
-        stats[25] += xp.sum(weights * tau)
-        stats[26] += xp.sum(weights * tau**2)
-        for i, coordinate in enumerate(coordinates):
-            stats[27 + i] += xp.sum(weights * coordinate * tau)
+        coordinates = None
+        if "position" in quantities:
+            coordinates = tuple(values[axis] for axis in ("x", "y", "z"))
+            for i, coordinate in enumerate(coordinates):
+                stats[1 + i] += xp.sum(weights * coordinate)
+            for i, first in enumerate(coordinates):
+                for j, second in enumerate(coordinates):
+                    stats[4 + 3 * i + j] += xp.sum(
+                        weights * first * second)
+        if "angle" in quantities:
+            angles = (values["theta_x"], values["theta_y"])
+            for i, angle in enumerate(angles):
+                stats[13 + i] += xp.sum(weights * angle)
+            for i, first in enumerate(angles):
+                for j, second in enumerate(angles):
+                    stats[15 + 2 * i + j] += xp.sum(
+                        weights * first * second)
+            if coordinates is not None:
+                for i, coordinate in enumerate(coordinates):
+                    for j, angle in enumerate(angles):
+                        stats[19 + 2 * i + j] += xp.sum(
+                            weights * coordinate * angle)
+        if "time" in quantities:
+            tau = values["time"]
+            stats[25] += xp.sum(weights * tau)
+            stats[26] += xp.sum(weights * tau**2)
+            if coordinates is not None:
+                for i, coordinate in enumerate(coordinates):
+                    stats[27 + i] += xp.sum(weights * coordinate * tau)
 
     def _accumulate_sample(self, event, scaled_energy, packet_weight, xp):
         nx, ny, nz = self._sample_direction(event, scaled_energy, xp)
@@ -1179,7 +1275,7 @@ class ObserverFrameRadiationAccumulator(object):
             if "observer_time" in self.enabled_channels
             and detector["half_angle"] > 0.0
         ]
-        if apertures:
+        if apertures and "energy_outside_apertures" in self.accounting:
             inside_any = xp.zeros(packet_weight.shape, dtype=xp.bool_)
             for detector in apertures:
                 direction = detector["direction"]
@@ -1210,34 +1306,45 @@ class ObserverFrameRadiationAccumulator(object):
 
         if "source_moments" in self.enabled_channels:
             for selection in self.source_moment_selections:
+                if selection["deterministic"]:
+                    continue
                 selected = self._selection_mask(selection, values, xp)
                 selected_values = {
                     key: value[selected] for key, value in values.items()}
                 self._update_moments(
                     self.moment_stats[selection["name"]], selected_values,
-                    packet_weight[selected], xp)
+                    packet_weight[selected], selection["quantities"], xp)
 
-    def _accumulate_coordinate_sources(self, event, w_perp, xp):
-        """Accumulate source projections that need no photon packet."""
-        if "source" not in self.enabled_channels:
-            return
+    def _accumulate_coordinate_products(self, event, w_perp, xp):
+        """Accumulate source products that need no photon packet."""
         values = {axis: event[axis] for axis in ("x", "y", "z")}
-        for projection in self.source_projections:
-            if not projection["deterministic"]:
-                continue
-            selected = self._selection_mask(
-                projection["selection"], values, xp)
-            key = "source/%s" % projection["name"]
-            runtime_edges = tuple(
-                self._runtime["source_axis/%s" % axis]
-                for axis in projection["axes"])
-            represented = self._histogram_add(
-                self.data[key],
-                tuple(values[axis][selected]
-                      for axis in projection["axes"]),
-                runtime_edges, w_perp[selected], xp)
-            self.accounting[
-                "represented/%s_energy" % key][0] += represented
+        if "source" in self.enabled_channels:
+            for projection in self.source_projections:
+                if not projection["deterministic"]:
+                    continue
+                selected = self._selection_mask(
+                    projection["selection"], values, xp)
+                key = "source/%s" % projection["name"]
+                runtime_edges = tuple(
+                    self._runtime["source_axis/%s" % axis]
+                    for axis in projection["axes"])
+                represented = self._histogram_add(
+                    self.data[key],
+                    tuple(values[axis][selected]
+                          for axis in projection["axes"]),
+                    runtime_edges, w_perp[selected], xp)
+                self.accounting[
+                    "represented/%s_energy" % key][0] += represented
+        if "source_moments" in self.enabled_channels:
+            for selection in self.source_moment_selections:
+                if not selection["deterministic"]:
+                    continue
+                selected = self._selection_mask(selection, values, xp)
+                selected_values = {
+                    key: value[selected] for key, value in values.items()}
+                self._update_moments(
+                    self.moment_stats[selection["name"]], selected_values,
+                    w_perp[selected], selection["quantities"], xp)
 
     def _accumulate_batch(self, particle_slice, simulation_time, xp):
         eon = self.eon
@@ -1251,7 +1358,10 @@ class ObserverFrameRadiationAccumulator(object):
         w_parallel = event["weight"] * event["p_parallel"] * dt_observer
         self.accounting["transverse_energy"][0] += xp.sum(w_perp)
         self.accounting["longitudinal_energy"][0] += xp.sum(w_parallel)
-        self._accumulate_coordinate_sources(event, w_perp, xp)
+        self.accounting[
+            "energy_truncated_by_spectral_closure"][0] += (
+                xp.sum(w_perp) * self.spectral_truncated_fraction)
+        self._accumulate_coordinate_products(event, w_perp, xp)
 
         if "observer_time" in self.enabled_channels:
             self._accumulate_detectors(event, xp)
@@ -1262,6 +1372,7 @@ class ObserverFrameRadiationAccumulator(object):
         spectral_mask = (w_perp > 0.0) & (event["omega_c"] > 0.0)
         spectral_event = self._filtered(event, spectral_mask)
         spectral_weight = w_perp[spectral_mask]
+        retained_fraction = self.spectral_cdf[-1]
         if self.energy_edges is not None:
             scale = hbar * spectral_event["omega_c"]
             below = self._cdf_at(self.energy_edges[0] / scale, xp)
@@ -1278,14 +1389,17 @@ class ObserverFrameRadiationAccumulator(object):
         for sample_index in range(self.samples_per_particle):
             probability = (
                 sample_index + xp.random.random(spectral_weight.size)
-            ) / self.samples_per_particle
+            ) / self.samples_per_particle * retained_fraction
             scaled_energy = self._inverse_cdf(probability, xp)
-            packet_weight = spectral_weight / self.samples_per_particle
+            packet_weight = (
+                spectral_weight * retained_fraction
+                / self.samples_per_particle
+            )
             self._accumulate_sample(
                 spectral_event, scaled_energy, packet_weight, xp)
 
     def accumulate(self, simulation_time=0.0):
-        """Accumulate one synchronized event in bounded particle batches."""
+        """Accumulate one available PIC event tuple in bounded batches."""
         if self.eon.Ntot == 0:
             return
         xp = self._xp()
@@ -1310,6 +1424,8 @@ class ObserverFrameRadiationAccumulator(object):
 def _as_edges_like_grid(values, name):
     """Validate a strictly increasing interpolation grid (not bin edges)."""
     grid = np.asarray(values, dtype=np.float64)
-    if grid.ndim != 1 or grid.size < 2 or not np.all(np.diff(grid) > 0.0):
+    if (grid.ndim != 1 or grid.size < 2
+            or not np.all(np.isfinite(grid))
+            or not np.all(np.diff(grid) > 0.0)):
         raise ValueError("`%s` must be a strictly increasing 1-D grid." % name)
     return grid.copy()

@@ -8,7 +8,12 @@
 - Reconstruct boosted emission position, time, momentum, fields, and the
   particle worldline interval in one observer frame; keep longitudinal power
   separate from the curvature spectrum.
-- Preserve the original three-axis synchrotron histogram as a legacy API.
+- Replace the maximal three-axis histogram with independently selectable
+  observer products and remove its energy-bin-scaled kernels.
+- Validate lepton species and forward projected-angle charts, use a stable
+  ultrarelativistic angular denominator, report the finite spectral tail, and
+  label separable band-detector and direction-conditioned source-time
+  closures explicitly.
 
 ## 0.26.0
 
