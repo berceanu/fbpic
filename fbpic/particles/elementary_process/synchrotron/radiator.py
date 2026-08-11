@@ -156,33 +156,54 @@ class SynchrotronRadiator(object):
             self.observer_accumulator.send_to_gpu()
         return self.observer_accumulator
 
-    @catch_gpu_memory_error
-    def begin_momentum_push(self):
-        """Capture the lower endpoint of a diagnostic pusher impulse.
+    @property
+    def has_observer_diagnostic(self):
+        """Whether the bounded pusher/radiation coupling path is active."""
+        return self.observer_accumulator is not None
 
-        Only the three dimensionless momentum components are copied. The
-        upper endpoint and the integer-time source position are consumed
-        immediately after the pusher returns, before any elementary process
-        can create particles or introduce a separate momentum jump.
-        """
+    def pusher_endpoint_buffer(self):
+        """Return the fixed-capacity lower-endpoint coupling buffer."""
         if self.observer_accumulator is None:
             return None
-        # Empty local ranks still record the completed pusher interval. This
-        # keeps represented-event timing consistent under MPI repartitioning
-        # and lets newly created particles start only with the next interval.
-        return (
-            self.eon.ux.copy(),
-            self.eon.uy.copy(),
-            self.eon.uz.copy(),
-        )
+        return self.observer_accumulator.pusher_endpoint_buffer
 
     @catch_gpu_memory_error
-    def end_momentum_push(self, lower_momentum, simulation_time):
-        """Accumulate one completed, integer-centered pusher impulse."""
-        if lower_momentum is None or self.observer_accumulator is None:
+    def accumulate_pusher_batch(
+            self, particle_slice, batch_count, simulation_time, event_index):
+        """Consume one batch immediately after its momentum push."""
+        if self.observer_accumulator is None:
             return
+        self.observer_accumulator.accumulate_impulse_batch(
+            self.observer_accumulator.pusher_endpoint_buffer,
+            particle_slice, int(batch_count), float(simulation_time),
+            int(event_index))
+
+    def complete_momentum_push(self, simulation_time, event_index):
+        """Mark one integer-centered pusher event complete exactly once."""
+        if self.observer_accumulator is None:
+            return
+        self.observer_accumulator.complete_impulse(
+            float(simulation_time), int(event_index))
+
+    def begin_momentum_push(self):
+        """Reject the removed full-species endpoint snapshot interface."""
+        raise RuntimeError(
+            "The full-species momentum snapshot interface was removed. "
+            "Use Particles.push_p, which streams bounded endpoint batches "
+            "directly from the pusher into the radiation accumulator.")
+
+    def end_momentum_push(self, lower_momentum, simulation_time):
+        """Accept explicitly supplied endpoints only for compatibility tests.
+
+        Production stepping never calls this path and never allocates complete
+        endpoint copies. Callers that already own lower endpoints may still
+        feed them to the accumulator without changing the physical event.
+        """
+        if self.observer_accumulator is None:
+            return
+        event_index = int(round(float(simulation_time) / self.dt))
         self.observer_accumulator.accumulate_impulse(
-            lower_momentum, float(simulation_time))
+            lower_momentum, float(simulation_time), event_index=event_index)
 
     def handle_radiation(self, simulation_time=0.0):
         """Reject the former mixed-time gathered-field event entry point.

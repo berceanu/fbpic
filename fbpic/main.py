@@ -492,7 +492,8 @@ class Simulation(object):
             # Push the particles' positions and velocities to t = (n+1/2) dt
             if move_momenta:
                 for species in ptcl:
-                    species.push_p( self.time + 0.5*self.dt )
+                    species.push_p(
+                        self.time + 0.5*self.dt, event_index=self.iteration )
 
             # Radiation events are complete: momentum endpoints bracket the
             # push and positions remain at its integer-time center. Keep this
@@ -590,14 +591,6 @@ class Simulation(object):
         # End of the N iterations
         # -----------------------
 
-        # A cadence boundary need not coincide with the end of step.
-        # Flush any completed radiation event not yet represented in output.
-        for diag in self.diags:
-            if getattr(diag, "write_after_momentum_push", False):
-                # The last completed impulse is centered at iteration - 1.
-                # Using that event iteration avoids colliding with a future
-                # scheduled write if this Simulation is stepped again.
-                diag.flush( max(0, self.iteration - 1) )
 
         # Finalize PIC loop
         # Get the charge density and the current from spectral space.
@@ -615,6 +608,22 @@ class Simulation(object):
         # Print the measured time taken by the PIC cycle
         if show_progress and (self.comm.rank==0):
             progress_bar.print_summary()
+
+
+    def finalize_diagnostics(self):
+        """Explicitly finalize dirty observer-radiation diagnostics.
+
+        Normal :meth:`step` calls never invoke this operation. Repeated calls
+        are safe and write only diagnostics with a completed, unwritten event.
+        The return value is the number of files written on this call.
+        """
+        writes = 0
+        for diag in self.diags:
+            if (getattr(diag, "write_after_momentum_push", False)
+                    and hasattr(diag, "finalize")):
+                if diag.finalize():
+                    writes += 1
+        return writes
 
 
     def deposit( self, fieldtype, exchange=False,

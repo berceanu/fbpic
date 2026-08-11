@@ -27,7 +27,8 @@ def _clean(value):
     return str(value).replace("/", "_").replace("-", "_")
 
 
-_ADDITIVE_SNAPSHOT_CATEGORIES = ("data", "accounting", "sampling")
+_ADDITIVE_SNAPSHOT_CATEGORIES = (
+    "data", "accounting", "sampling", "source_z")
 
 
 def _subtract_snapshot(current, previous):
@@ -429,6 +430,62 @@ def pulse_components(raw_energy, time_edges, per_solid_angle, interval):
     }
 
 
+def source_z_interval_components(histogram, edges, fractions):
+    """Derive equal-tail central energy intervals from a mergeable histogram."""
+    histogram = np.asarray(histogram, dtype=np.float64)
+    edges = np.asarray(edges, dtype=np.float64)
+    if histogram.size != edges.size + 1:
+        raise ValueError("Source-z histogram must include two tail bins.")
+    underflow = float(histogram[0])
+    interior = histogram[1:-1]
+    overflow = float(histogram[-1])
+    contained = float(interior.sum())
+    total = underflow + contained + overflow
+
+    def quantile(fraction):
+        if not total > 0.0:
+            return np.nan
+        target = fraction * total
+        if target <= underflow:
+            return -np.inf
+        target -= underflow
+        if target > contained:
+            return np.inf
+        cumulative = np.cumsum(interior)
+        index = min(
+            int(np.searchsorted(cumulative, target, side="left")),
+            interior.size - 1)
+        previous = cumulative[index - 1] if index > 0 else 0.0
+        within = 0.0
+        if interior[index] > 0.0:
+            within = (target - previous) / interior[index]
+        return float(
+            edges[index] + within * (edges[index + 1] - edges[index]))
+
+    components = {
+        "source_z_interval_total_energy": (total, _ENERGY_DIMENSION),
+        "source_z_interval_contained_energy": (
+            contained, _ENERGY_DIMENSION),
+        "source_z_interval_underflow_energy": (
+            underflow, _ENERGY_DIMENSION),
+        "source_z_interval_overflow_energy": (
+            overflow, _ENERGY_DIMENSION),
+        "source_z_interval_contained_fraction": (
+            contained / total if total > 0.0 else 0.0,
+            _DIMENSIONLESS),
+    }
+    for fraction in fractions:
+        lower = quantile(0.5 * (1.0 - fraction))
+        upper = quantile(0.5 * (1.0 + fraction))
+        label = ("%g" % (100.0 * fraction)).replace(".", "p")
+        prefix = "central_%s_percent_z" % label
+        components[prefix + "_start"] = (lower, _LENGTH_DIMENSION)
+        components[prefix + "_end"] = (upper, _LENGTH_DIMENSION)
+        components[prefix + "_width"] = (
+            upper - lower, _LENGTH_DIMENSION)
+    return components
+
+
 class ObserverRadiationWriter(object):
     """Write reduced observer-frame accumulator snapshots."""
 
@@ -455,6 +512,29 @@ class ObserverRadiationWriter(object):
             return local_pending
         return bool(comm_simple.allreduce(int(local_pending)))
 
+    def latest_unwritten_event_index(self):
+        """Return the latest completed event not represented by a file."""
+        event = self.latest_unwritten_event()
+        return None if event is None else event[0]
+
+    def latest_unwritten_event(self):
+        """Return ``(index, center time)`` for the newest dirty event.
+
+        Every rank, including an empty rank, completes the same pusher event,
+        so this local metadata is decomposition independent without a particle
+        reduction.
+        """
+        events = [
+            (accumulator.last_completed_event_index,
+             accumulator.cumulative_timing["last_event_center"])
+            for species_name, accumulator
+            in self.diagnostic.accumulators.items()
+            if (accumulator.completed_event_count
+                > self.last_written_events.get(species_name, 0)
+                and accumulator.last_completed_event_index is not None)
+        ]
+        return max(events, key=lambda item: item[0]) if events else None
+
     def _reduce(self, value):
         diagnostic = self.diagnostic
         size = 1 if diagnostic.comm is None else diagnostic.comm.size
@@ -474,6 +554,14 @@ class ObserverRadiationWriter(object):
         if diagnostic.rank != 0:
             return None
         return np.maximum.reduce(gathered)
+
+    def _reduce_resolution(self, value):
+        """Reduce a [maximum, additive statistics...] resolution state."""
+        reduced = self._reduce(value)
+        maximum = self._reduce_max(value[:1])
+        if self.diagnostic.rank == 0:
+            reduced[0] = maximum[0]
+        return reduced
 
     def _reduce_moments(self, value):
         diagnostic = self.diagnostic
@@ -501,6 +589,8 @@ class ObserverRadiationWriter(object):
         if not nonempty:
             return {
                 "event_count": 0,
+                "first_event_index": np.iinfo(np.int64).max,
+                "last_event_index": np.iinfo(np.int64).min,
                 "first_event_center": math.inf,
                 "last_event_center": -math.inf,
                 "represented_interval_start": math.inf,
@@ -509,6 +599,10 @@ class ObserverRadiationWriter(object):
         return {
             "event_count": max(
                 item["event_count"] for item in nonempty),
+            "first_event_index": min(
+                item["first_event_index"] for item in nonempty),
+            "last_event_index": max(
+                item["last_event_index"] for item in nonempty),
             "first_event_center": min(
                 item["first_event_center"] for item in nonempty),
             "last_event_center": max(
@@ -530,6 +624,9 @@ class ObserverRadiationWriter(object):
         reduced["quality"] = {
             key: self._reduce_max(snapshot["quality"][key])
             for key in sorted(snapshot["quality"])}
+        reduced["resolution"] = {
+            key: self._reduce_resolution(snapshot["resolution"][key])
+            for key in sorted(snapshot["resolution"])}
         reduced["moments"] = {
             key: self._reduce_moments(snapshot["moments"][key])
             for key in sorted(snapshot["moments"])}
@@ -559,6 +656,7 @@ class ObserverRadiationWriter(object):
                 else:
                     interval = _subtract_snapshot(current, previous)
                 interval["quality"] = interval_state["quality"]
+                interval["resolution"] = interval_state["resolution"]
                 interval["moments"] = interval_state["moments"]
                 interval["timing"] = interval_state["timing"]
                 # The cumulative host snapshot is already detached from the
@@ -601,6 +699,8 @@ class ObserverRadiationWriter(object):
             "x_observer=Lambda_simulation_to_observer*x_simulation+b")
         record.attrs["worldlineIntervalTransform"] = _bytes(
             "dt_observer=(gamma_observer/gamma_simulation)*dt_simulation")
+        record.attrs["randomStreamIdentifiers"] = _bytes(json.dumps(
+            accumulator.random_stream_ids, sort_keys=True))
         record.attrs["species"] = _bytes(species_name)
         record.attrs["accumulationMode"] = _bytes(mode)
         record.attrs["cumulative"] = np.uint32(mode == "cumulative")
@@ -615,12 +715,17 @@ class ObserverRadiationWriter(object):
         record.attrs["particleBatchSize"] = accumulator.particle_batch_size
         record.attrs["randomSeed"] = np.uint64(accumulator.random_seed)
         record.attrs["randomSamplingMethod"] = _bytes(
-            "stateless_splitmix64_physical_event_key")
+            "stateless_splitmix64_persistent_particle_identity")
         record.attrs["randomEventKey"] = _bytes(
-            "simulation_event_index_and_integer_centered_phase_space")
+            "diagnostic_seed;persistent_particle_id;event_index;"
+            "independent_stream_id;sample_index;species_namespace")
+        record.attrs["randomSpeciesNamespace"] = np.uint64(
+            accumulator.random_namespace)
+        record.attrs["persistentParticleIdentitySource"] = _bytes(
+            "fbpic_particle_tracker_uint64")
         record.attrs["randomOrderIndependence"] = _bytes(
-            "particle_batching;particle_sorting;MPI_ownership;"
-            "CPU_GPU_execution_order")
+            "particle_batching;particle_sorting;particle_migration;"
+            "MPI_ownership;CPU_GPU_execution_order")
         record.attrs["particleSamplingFraction"] = (
             accumulator.particle_sampling_fraction)
         record.attrs["particleThinning"] = np.uint32(
@@ -629,10 +734,15 @@ class ObserverRadiationWriter(object):
             "Bernoulli_Horvitz_Thompson_linear_in_macroparticle_weight")
         record.attrs["estimatedDenseProductBytes"] = np.uint64(
             accumulator.estimated_dense_product_bytes)
+        record.attrs["estimatedTotalDiagnosticBytes"] = np.uint64(
+            accumulator.estimated_total_allocation_bytes)
         record.attrs["maxAllocationBytes"] = (
             np.uint64(accumulator.max_allocation_bytes)
             if accumulator.max_allocation_bytes is not None
             else _bytes("unlimited"))
+        record.attrs["allocationLimitScope"] = _bytes(
+            "complete_peak_diagnostic_footprint_including_persistent_batch_"
+            "lookup_reduction_writer_and_pusher_coupling_memory")
         record.attrs["allocationBreakdown"] = _bytes(json.dumps(
             accumulator.allocation_breakdown, sort_keys=True))
         record.attrs["gammaThreshold"] = accumulator.gamma_cutoff
@@ -675,7 +785,7 @@ class ObserverRadiationWriter(object):
             "c_times_endpoint_four_velocity_difference_over_centered_"
             "proper_time")
         record.attrs["eventInvariantContract"] = _bytes(
-            "U_squared_equals_c_squared;U_dot_A_equals_zero")
+            "U_squared_equals_one;U_dot_A_equals_zero")
         record.attrs["observerCoordinateTimeWeight"] = _bytes(
             "delta_t_observer=gamma_observer*delta_tau")
         record.attrs["observerTimeConvention"] = _bytes(
@@ -688,6 +798,10 @@ class ObserverRadiationWriter(object):
             record.attrs["representedEventCount"] = np.uint64(
                 timing["event_count"])
             if timing["event_count"] > 0:
+                record.attrs["firstIncludedEventIteration"] = np.int64(
+                    timing["first_event_index"])
+                record.attrs["lastIncludedEventIteration"] = np.int64(
+                    timing["last_event_index"])
                 record.attrs["firstEventCenterTimeSimulation"] = (
                     timing["first_event_center"])
                 record.attrs["lastEventCenterTimeSimulation"] = (
@@ -866,10 +980,16 @@ class ObserverRadiationWriter(object):
                 effective_measure = "integrated_over_sampled_angles"
             record.attrs["sourceEffectiveAngularMeasure"] = _bytes(
                 effective_measure)
-            if "time" in projection["axes"]:
+            uses_source_time = (
+                "time" in projection["axes"]
+                or any(key in projection["selection"] for key in (
+                    "observer_time_range", "time_range")))
+            if uses_source_time:
                 reference = projection["time_reference"]
                 record.attrs["sourceTimeReference"] = _bytes(reference)
                 if reference == "photon_direction":
+                    record.attrs["sourceTimeConvention"] = _bytes(
+                        "sampled_photon_direction_source_time")
                     record.attrs["observerTimeDefinition"] = _bytes(
                         "t_observer_minus_sampled_photon_direction_dot_"
                         "r_over_c")
@@ -877,6 +997,8 @@ class ObserverRadiationWriter(object):
                         "direction_conditioned_radiation_phase_coordinate;"
                         "angle_marginals_mix_distinct_null_coordinates")
                 else:
+                    record.attrs["sourceTimeConvention"] = _bytes(
+                        "fixed_detector_referenced_source_time")
                     record.attrs["observerTimeDefinition"] = _bytes(
                         "tau_D=t_observer-n_D_dot_r_observer/c")
                     record.attrs["observerTimeConditioning"] = _bytes(
@@ -1013,42 +1135,92 @@ class ObserverRadiationWriter(object):
                 "deterministicApertureAccounting": _bytes(
                     "independent_Lienard_quadrature_estimator"),
                 "apertureComplementSemantics": _bytes(
-                    "stochastic_outside_aperture_and_deterministic_inside_"
-                    "aperture_are_not_reported_as_exact_complements"),
+                    "deterministic_broadband_aperture_energy_is_independent_"
+                    "of_stochastic_spectral_angular_inside_and_outside;"
+                    "only_stochastic_inside_plus_stochastic_outside_is_an_"
+                    "exact_same_packet_partition"),
+                "deterministicBroadbandApertureEstimator": _bytes(
+                    "Lienard_direction_quadrature_including_transverse_and_"
+                    "longitudinal_acceleration"),
+                "stochasticApertureEstimator": _bytes(
+                    "retained_transverse_synchrotron_spectral_angular_packets"),
+                "stochasticOutsideApertureEstimator": _bytes(
+                    "same_retained_transverse_packets_not_inside_detector"),
                 "angularLossIncludesLongitudinalAcceleration": np.uint32(0),
             })
 
     def _write_quality(self, field_group, accumulator, species_name,
-                       mode, quality):
+                       mode, quality, resolution):
         components = {
             key: (float(value[0]), _DIMENSIONLESS)
             for key, value in quality.items()}
+        for quantity, state in resolution.items():
+            maximum, energy, weighted_sum, weighted_square, above = (
+                float(value) for value in state)
+            mean = weighted_sum / energy if energy > 0.0 else 0.0
+            rms = (
+                math.sqrt(max(weighted_square / energy, 0.0))
+                if energy > 0.0 else 0.0)
+            above_fraction = above / energy if energy > 0.0 else 0.0
+            components["max_%s" % quantity] = (
+                maximum, _DIMENSIONLESS)
+            components[
+                "transverse_energy_weighted_mean_%s" % quantity] = (
+                    mean, _DIMENSIONLESS)
+            components[
+                "transverse_energy_weighted_rms_%s" % quantity] = (
+                    rms, _DIMENSIONLESS)
+            components[
+                "transverse_energy_fraction_above_%s_warning_threshold"
+                % quantity] = (above_fraction, _DIMENSIONLESS)
         name = "radiationEventQuality_%s_%s" % (
             _clean(species_name), mode)
         self._write_component_group(
             field_group, name, components, accumulator, species_name, mode,
             {
                 "longName": _bytes(
-                    "centered pusher impulse invariant residuals"),
+                    "centered pusher impulse invariants and physical "
+                    "finite-step resolution"),
                 "massShellResidualDefinition": _bytes(
-                    "abs(U_center_squared_over_c_squared_minus_one)_"
+                    "abs(U_center_squared_minus_one)_"
                     "over_Euclidean_four_velocity_norm_squared"),
                 "orthogonalityResidualDefinition": _bytes(
                     "abs(U_center_dot_A)_over_product_of_Euclidean_norms"),
                 "powerIdentityResidualDefinition": _bytes(
                     "abs(P_perp_plus_P_parallel_plus_C_A_A_squared)_"
                     "over_invariant_power"),
+                "deltaEtaDefinition": _bytes(
+                    "arcosh(U_plus_dot_U_minus)"),
+                "deltaThetaUDefinition": _bytes(
+                    "arccos(clipped_u_plus_hat_dot_u_minus_hat)"),
+                "zeroMomentumTurnConvention": _bytes(
+                    "delta_theta_u_equals_zero_if_either_endpoint_has_"
+                    "zero_spatial_momentum"),
+                "chiTurnDefinition": _bytes(
+                    "gamma_center_simulation_times_delta_theta_u"),
+                "resolutionWarningThresholds": _bytes(json.dumps(
+                    accumulator.resolution_warning_thresholds,
+                    sort_keys=True)),
+                "resolutionWeighting": _bytes(
+                    "exact_unthinned_transverse_radiation_energy"),
+                "resolutionIndicatorsModifyEvents": np.uint32(0),
             })
 
     def _write_sampling(self, field_group, accumulator, species_name,
                         mode, sampling):
         components = {}
         for key, value in sampling.items():
+            is_energy_variance = "energy_sampling_variance" in key
             dimension = (
                 2.0 * _ENERGY_DIMENSION
-                if key.endswith("_energy_sampling_variance")
-                else _DIMENSIONLESS)
-            components[key] = (float(value[0]), dimension)
+                if is_energy_variance else _DIMENSIONLESS)
+            variance = float(value[0])
+            components[key] = (variance, dimension)
+            if is_energy_variance and "/" in key:
+                uncertainty_name = key.replace(
+                    "energy_sampling_variance", "energy_sampling_uncertainty")
+                components[uncertainty_name] = (
+                    math.sqrt(max(variance, 0.0)), _ENERGY_DIMENSION)
         transverse_variance = float(
             sampling["transverse_energy_sampling_variance"][0])
         longitudinal_variance = float(
@@ -1077,13 +1249,21 @@ class ObserverRadiationWriter(object):
                 "samplingEstimator": _bytes(
                     "Bernoulli_Horvitz_Thompson"),
                 "uncertaintyScope": _bytes(
-                    "diagnostic_particle_thinning_only;"
-                    "spectral_angular_packet_noise_reported_by_configuration"),
+                    "particle_thinning_for_total_energy;"
+                    "spectral_angular_packet_membership_for_stochastic_"
+                    "aperture_estimators"),
+                "apertureSamplingUncertaintyEstimator": _bytes(
+                    "within_event_packet_replication_variance;"
+                    "Bernoulli_Horvitz_Thompson_particle_thinning_variance;"
+                    "single_packet_uses_conservative_Bernoulli_upper_bound"),
+                "stochasticAperturePartition": _bytes(
+                    "inside_plus_outside_equals_same_packet_estimator_"
+                    "exactly_for_each_detector"),
                 "unbiasedLinearObservables": np.uint32(1),
             })
 
     def _write_moments(self, field_group, accumulator, species_name,
-                       mode, moments):
+                       mode, moments, source_z):
         selections = {
             item["name"]: item for item in accumulator.source_moment_selections}
         for selection_name, stats in moments.items():
@@ -1110,11 +1290,17 @@ class ObserverRadiationWriter(object):
                     "canonical_major_eigenvector_with_nonnegative_x;"
                     "orientation_modulo_pi"),
             }
-            if "time" in selection["quantities"]:
+            uses_source_time = (
+                "time" in selection["quantities"]
+                or any(key in selection for key in (
+                    "observer_time_range", "time_range")))
+            if uses_source_time:
                 reference = selection["time_reference"]
                 if reference == "photon_direction":
                     attributes.update({
                         "sourceTimeReference": _bytes(reference),
+                        "sourceTimeConvention": _bytes(
+                            "sampled_photon_direction_source_time"),
                         "observerTimeDefinition": _bytes(
                             "t_observer_minus_sampled_photon_direction_dot_"
                             "r_over_c"),
@@ -1125,6 +1311,8 @@ class ObserverRadiationWriter(object):
                 else:
                     attributes.update({
                         "sourceTimeReference": _bytes(reference),
+                        "sourceTimeConvention": _bytes(
+                            "fixed_detector_referenced_source_time"),
                         "observerTimeDefinition": _bytes(
                             "tau_D=t_observer-n_D_dot_r_observer/c"),
                         "observerTimeConditioning": _bytes(
@@ -1133,11 +1321,27 @@ class ObserverRadiationWriter(object):
                         "sourceTimeDetectorDirection": (
                             selection["time_direction"]),
                     })
+            components = source_moment_components(
+                stats, selection["quantities"])
+            if selection_name in source_z:
+                components.update(source_z_interval_components(
+                    source_z[selection_name],
+                    accumulator.source_z_interval_edges,
+                    accumulator.source_z_intervals))
+                attributes.update({
+                    "sourceZCentralIntervalFractions":
+                        np.asarray(accumulator.source_z_intervals),
+                    "sourceZIntervalEdges":
+                        accumulator.source_z_interval_edges,
+                    "sourceZIntervalDefinition": _bytes(
+                        "equal_tail_central_radiation_energy_interval"),
+                    "sourceZIntervalEstimator": _bytes(
+                        "mergeable_weighted_histogram_with_explicit_"
+                        "underflow_and_overflow"),
+                })
             self._write_component_group(
-                field_group, name, source_moment_components(
-                    stats, selection["quantities"]),
-                accumulator, species_name, mode,
-                attributes)
+                field_group, name, components,
+                accumulator, species_name, mode, attributes)
 
     def _write_pulse_metrics(self, field_group, accumulator, species_name,
                              mode, data):
@@ -1173,13 +1377,30 @@ class ObserverRadiationWriter(object):
                         "peakDefinition": _bytes("maximum_bin_average_power"),
                     })
 
-    def write(self, iteration, final_flush=False):
+    def write(self, iteration=None, final_flush=False):
+        """Write one dirty snapshot using its latest event as file index."""
+        if not self.has_unwritten_events():
+            return False
+        latest_event = self.latest_unwritten_event()
+        if latest_event is None:
+            raise RuntimeError(
+                "Radiation state is dirty but has no completed event index.")
+        file_iteration, last_event_center = latest_event
+        file_iteration = int(file_iteration)
+        requested_iteration = (
+            None if iteration is None else int(iteration))
         diagnostic = self.diagnostic
         file_handle = None
         successful = False
         self.final_flush = bool(final_flush)
+        initially_on_gpu = {
+            species_name: bool(
+                diagnostic.accumulators[species_name]._on_gpu)
+            for species_name in diagnostic.species_names}
         if diagnostic.use_cuda:
             for species_name in diagnostic.species_names:
+                if not initially_on_gpu[species_name]:
+                    continue
                 radiator = diagnostic.species[
                     species_name].synchrotron_radiator
                 radiator.receive_from_gpu()
@@ -1187,24 +1408,39 @@ class ObserverRadiationWriter(object):
             snapshots = self._snapshots()
             first = next(iter(diagnostic.accumulators.values()))
             observer_time = (
-                first.gamma_boost * iteration * diagnostic.dt_sim
+                first.gamma_boost * last_event_center
                 + first.observer_translation[0] / c)
             observer_dt = first.gamma_boost * diagnostic.dt_sim
-            filename = "data%08d.h5" % iteration
+            filename = "data%08d.h5" % file_iteration
             fullpath = os.path.join(diagnostic.write_dir, "hdf5", filename)
             file_handle = diagnostic.open_file(fullpath)
             if file_handle is not None:
                 diagnostic.setup_openpmd_file(
-                    file_handle, iteration, observer_time, observer_dt)
-                iteration_group = file_handle["/data/%d" % iteration]
+                    file_handle, file_iteration, observer_time, observer_dt)
+                iteration_group = file_handle[
+                    "/data/%d" % file_iteration]
                 iteration_group.attrs["timeReferenceFrame"] = _bytes(
                     first.observer_frame)
                 iteration_group.attrs["timeReferenceEvent"] = _bytes(
-                    "simulation_origin_z_equals_zero")
+                    "simulation_origin_z_equals_zero_at_latest_included_"
+                    "event_center")
                 iteration_group.attrs["radiationOutputPhase"] = _bytes(
                     "post_centered_pusher_impulse")
                 iteration_group.attrs["radiationFinalFlush"] = np.uint32(
                     final_flush)
+                iteration_group.attrs["radiationWriteTrigger"] = _bytes(
+                    "explicit_finalization" if final_flush
+                    else "scheduled_cadence")
+                iteration_group.attrs[
+                    "radiationLastIncludedEventIteration"] = np.int64(
+                    file_iteration)
+                iteration_group.attrs[
+                    "radiationLastIncludedEventCenterSimulation"] = (
+                    last_event_center)
+                if requested_iteration is not None:
+                    iteration_group.attrs[
+                        "radiationRequestedWriteIteration"] = np.int64(
+                        requested_iteration)
                 iteration_group.attrs["observerLorentzTransform"] = (
                     self._lorentz_matrix(first).ravel())
                 iteration_group.attrs["observerLorentzTransformShape"] = (
@@ -1224,13 +1460,13 @@ class ObserverRadiationWriter(object):
                             snapshot["accounting"])
                         self._write_quality(
                             field_group, accumulator, species_name, mode,
-                            snapshot["quality"])
+                            snapshot["quality"], snapshot["resolution"])
                         self._write_sampling(
                             field_group, accumulator, species_name, mode,
                             snapshot["sampling"])
                         self._write_moments(
                             field_group, accumulator, species_name, mode,
-                            snapshot["moments"])
+                            snapshot["moments"], snapshot["source_z"])
                         self._write_pulse_metrics(
                             field_group, accumulator, species_name, mode,
                             snapshot["data"])
@@ -1248,6 +1484,9 @@ class ObserverRadiationWriter(object):
             self.final_flush = False
             if diagnostic.use_cuda:
                 for species_name in diagnostic.species_names:
+                    if not initially_on_gpu[species_name]:
+                        continue
                     radiator = diagnostic.species[
                         species_name].synchrotron_radiator
                     radiator.send_to_gpu()
+        return True

@@ -99,6 +99,75 @@ def push_p_gpu( ux, uy, uz, inv_gamma,
             Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip], econst, bconst)
 
 
+
+@compile_cupy
+def push_p_with_endpoint_gpu(ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, q, m, i_start, N_batch, dt,
+                ux_minus, uy_minus, uz_minus):
+    """Push one bounded batch and retain lower endpoints on the device."""
+    i_batch = cuda.grid(1)
+    if i_batch < N_batch:
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        econst = q*dt/(m*c)
+        bconst = 0.5*q*dt/m
+        ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+            ux_i, uy_i, uz_i, inv_gamma[ip],
+            Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip], econst, bconst)
+
+
+@compile_cupy
+def push_p_after_plane_with_endpoint_gpu(
+                z, z_plane, ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, q, m, i_start, N_batch, dt,
+                ux_minus, uy_minus, uz_minus):
+    """Push a bounded ballistic-plane batch and retain lower endpoints."""
+    i_batch = cuda.grid(1)
+    if i_batch < N_batch:
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        if z[ip] > z_plane:
+            econst = q*dt/(m*c)
+            bconst = 0.5*q*dt/m
+            ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+                ux_i, uy_i, uz_i, inv_gamma[ip],
+                Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip],
+                econst, bconst)
+
+
+@compile_cupy
+def push_p_ioniz_with_endpoint_gpu(ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, m, i_start, N_batch, dt,
+                ionization_level, ux_minus, uy_minus, uz_minus):
+    """Push a bounded variable-charge batch and retain lower endpoints."""
+    i_batch = cuda.grid(1)
+    if i_batch < N_batch:
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        if ionization_level[ip] != 0:
+            econst = ionization_level[ip] * e * dt/(m*c)
+            bconst = 0.5 * ionization_level[ip] * e * dt/m
+            ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+                ux_i, uy_i, uz_i, inv_gamma[ip],
+                Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip],
+                econst, bconst)
+
+
 @compile_cupy
 def push_p_after_plane_gpu( z, z_plane, ux, uy, uz, inv_gamma,
                 Ex, Ey, Ez, Bx, By, Bz, q, m, Ntot, dt ) :

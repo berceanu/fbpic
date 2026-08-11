@@ -49,6 +49,80 @@ def push_p_numba( ux, uy, uz, inv_gamma,
 
     return ux, uy, uz, inv_gamma
 
+
+
+@njit_parallel
+def push_p_with_endpoint_numba(ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, q, m, i_start, N_batch, dt,
+                ux_minus, uy_minus, uz_minus):
+    """Push one bounded batch and retain its lower momentum endpoint.
+
+    The endpoint arrays are indexed locally within the batch. This is the
+    pusher/radiation coupling path: it avoids making three full-species
+    copies while leaving the arithmetic of push_p_vay unchanged.
+    """
+    econst = q*dt/(m*c)
+    bconst = 0.5*q*dt/m
+    for i_batch in prange(N_batch):
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+            ux_i, uy_i, uz_i, inv_gamma[ip],
+            Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip], econst, bconst)
+
+
+@njit_parallel
+def push_p_after_plane_with_endpoint_numba(
+                z, z_plane, ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, q, m, i_start, N_batch, dt,
+                ux_minus, uy_minus, uz_minus):
+    """Push a bounded ballistic-plane batch and retain lower endpoints."""
+    econst = q*dt/(m*c)
+    bconst = 0.5*q*dt/m
+    for i_batch in prange(N_batch):
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        if z[ip] > z_plane:
+            ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+                ux_i, uy_i, uz_i, inv_gamma[ip],
+                Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip],
+                econst, bconst)
+
+
+@njit_parallel
+def push_p_ioniz_with_endpoint_numba(ux, uy, uz, inv_gamma,
+                Ex, Ey, Ez, Bx, By, Bz, m, i_start, N_batch, dt,
+                ionization_level, ux_minus, uy_minus, uz_minus):
+    """Push a bounded variable-charge batch and retain lower endpoints."""
+    prefactor_econst = e*dt/(m*c)
+    prefactor_bconst = 0.5*e*dt/m
+    for i_batch in prange(N_batch):
+        ip = i_start + i_batch
+        ux_i = ux[ip]
+        uy_i = uy[ip]
+        uz_i = uz[ip]
+        ux_minus[i_batch] = ux_i
+        uy_minus[i_batch] = uy_i
+        uz_minus[i_batch] = uz_i
+        if ionization_level[ip] == 0:
+            continue
+        econst = prefactor_econst * ionization_level[ip]
+        bconst = prefactor_bconst * ionization_level[ip]
+        ux[ip], uy[ip], uz[ip], inv_gamma[ip] = push_p_vay(
+            ux_i, uy_i, uz_i, inv_gamma[ip],
+            Ex[ip], Ey[ip], Ez[ip], Bx[ip], By[ip], Bz[ip],
+            econst, bconst)
+
 @njit_parallel
 def push_p_after_plane_numba( z, z_plane, ux, uy, uz, inv_gamma,
                 Ex, Ey, Ez, Bx, By, Bz, q, m, Ntot, dt ) :

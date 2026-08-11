@@ -18,6 +18,8 @@ from fbpic.openpmd_diag.observer_radiation_diag import (
 )
 from fbpic.particles.elementary_process.synchrotron.observer import (
     ObserverFrameRadiationAccumulator,
+    _RANDOM_STREAM_PHOTON_ENERGY,
+    _event_uniform,
 )
 from fbpic.particles.elementary_process.synchrotron.radiator import (
     SynchrotronRadiator,
@@ -34,7 +36,7 @@ ANGULAR_POWER_FACTOR = e**2 / (16.0 * np.pi**2 * epsilon_0 * c)
 
 
 def _species(u, electric, c_magnetic, dt=2.0e-18, count=1, weight=1.0,
-             positions=None, charge=-e, mass=m_e):
+             positions=None, charge=-e, mass=m_e, particle_ids=None):
     u = np.asarray(u, dtype=np.float64)
     electric = np.asarray(electric, dtype=np.float64)
     c_magnetic = np.asarray(c_magnetic, dtype=np.float64)
@@ -45,6 +47,13 @@ def _species(u, electric, c_magnetic, dt=2.0e-18, count=1, weight=1.0,
     if positions.shape == (3,):
         positions = np.repeat(positions[None, :], count, axis=0)
 
+
+    if particle_ids is None:
+        particle_ids = np.arange(count, dtype=np.uint64)
+    particle_ids = np.asarray(particle_ids, dtype=np.uint64)
+    if particle_ids.shape != (count,):
+        raise ValueError("particle_ids must match the local particle count")
+    tracker = SimpleNamespace(id=particle_ids.copy())
     def full(value):
         return np.full(count, value, dtype=np.float64)
 
@@ -57,7 +66,7 @@ def _species(u, electric, c_magnetic, dt=2.0e-18, count=1, weight=1.0,
         Bx=full(c_magnetic[0] / c), By=full(c_magnetic[1] / c),
         Bz=full(c_magnetic[2] / c), w=full(weight),
         inv_gamma=full(1.0 / gamma), synchrotron_radiator=None,
-        injector=None, ionizer=None,
+        injector=None, ionizer=None, tracker=tracker,
     )
 
 
@@ -71,6 +80,8 @@ def _activate(species, boost=None, gamma_cutoff=2.0, x_max=8.0):
 
 
 def _diagnostic(tmp_path, species, **kwargs):
+    kwargs.setdefault(
+        "particle_batch_size", max(1, min(int(species.Ntot), 256)))
     return SynchrotronRadiationDiagnostic(
         period=1,
         species={"electrons": species},
@@ -81,7 +92,11 @@ def _diagnostic(tmp_path, species, **kwargs):
 
 
 def _complete_impulse(radiator, species, simulation_time):
-    lower = radiator.begin_momentum_push()
+    # Compatibility path for callers that already own complete endpoints;
+    # production Particles.push_p uses the bounded pusher-owned buffer.
+    lower = tuple(
+        component.copy()
+        for component in (species.ux, species.uy, species.uz))
     push_p_numba(
         species.ux, species.uy, species.uz, species.inv_gamma,
         species.Ex, species.Ey, species.Ez,
@@ -407,7 +422,7 @@ def test_broadband_aperture_is_deterministic_and_band_is_labeled(tmp_path):
         }],
     )
     accumulator = diagnostic.accumulators["electrons"]
-    assert not accumulator.needs_spectral_samples
+    assert accumulator.needs_spectral_samples
     assert accumulator.needs_joint_band_model
     assert accumulator.angular_kernel_x is not None
     assert "energy_outside_apertures" not in accumulator.accounting
@@ -439,11 +454,28 @@ def test_broadband_aperture_is_deterministic_and_band_is_labeled(tmp_path):
     assert accumulator.data[band_key].sum() == pytest.approx(
         expected_band, rel=3.0e-13)
     assert accumulator.data["detector/selected/aperture"].sum() > 0.0
+    deterministic = accumulator.accounting[
+        "deterministic_broadband_aperture_energy/selected"][0]
+    stochastic_inside = accumulator.accounting[
+        "stochastic_spectral_angular_aperture_energy/selected"][0]
+    stochastic_outside = accumulator.accounting[
+        "stochastic_spectral_angular_outside_aperture_energy/selected"][0]
+    stochastic_partition = accumulator.accounting[
+        "stochastic_spectral_angular_partition_energy/selected"][0]
+    assert deterministic > 0.0
+    assert stochastic_inside + stochastic_outside == pytest.approx(
+        stochastic_partition, rel=2.0e-15)
+    assert stochastic_partition == pytest.approx(
+        accumulator.accounting["transverse_energy"][0]
+        * accumulator.spectral_cdf[-1], rel=2.0e-15)
+    assert accumulator.sampling[
+        "stochastic_spectral_angular_aperture_energy_sampling_variance/selected"
+    ][0] > 0.0
 
     diagnostic.write_hdf5(1)
     with h5py.File(
-            tmp_path / "hdf5" / "data00000001.h5", "r") as output:
-        fields = output["data/1/fields"]
+            tmp_path / "hdf5" / "data00000000.h5", "r") as output:
+        fields = output["data/0/fields"]
         name = next(
             value for value in fields
             if "ObserverTime_selected_band_all_direction" in value)
@@ -565,8 +597,8 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
     diagnostic.write_hdf5(2)
 
     with h5py.File(
-            tmp_path / "hdf5" / "data00000002.h5", "r") as output:
-        fields = output["data/2/fields"]
+            tmp_path / "hdf5" / "data00000001.h5", "r") as output:
+        fields = output["data/1/fields"]
         source_name = next(
             name for name in fields
             if "Source_x_time" in name and name.endswith("_cumulative"))
@@ -575,6 +607,8 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
             source.attrs["observerTimeConditioning"])
         assert "distinct_null_coordinates" in _attribute_text(
             source.attrs["observerTimeConditioning"])
+        assert _attribute_text(source.attrs["sourceTimeConvention"]) == (
+            "sampled_photon_direction_source_time")
 
         moment_name = next(
             name for name in fields
@@ -583,6 +617,8 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
         moment = fields[moment_name]
         assert "direction_conditioned" in _attribute_text(
             moment.attrs["observerTimeConditioning"])
+        assert _attribute_text(moment.attrs["sourceTimeConvention"]) == (
+            "sampled_photon_direction_source_time")
         assert any(
             "SourceMoments_all" in name
             and name.endswith("covariance_theta_x_observer_time")
@@ -603,7 +639,7 @@ def test_source_time_metadata_and_interval_snapshots(tmp_path):
         assert fields[interval_name][0] == pytest.approx(
             second_step_energy, rel=3.0e-14)
 
-        assert "radiationAxes" in output["data/2"]
+        assert "radiationAxes" in output["data/1"]
         assert source.attrs["axisEdgePaths"].size == 2
 
 
@@ -619,6 +655,8 @@ def test_particles_push_hook_is_centered_and_excludes_later_jumps(tmp_path):
 
     lower = np.array([
         species.ux[0], species.uy[0], species.uz[0]])
+    species._push_p_with_radiation = lambda t, z_plane, event_index: (
+        Particles._push_p_with_radiation(species, t, z_plane, event_index))
     Particles.push_p(species, 0.5 * species.dt)
     upper = np.array([
         species.ux[0], species.uy[0], species.uz[0]])
@@ -647,7 +685,8 @@ def test_nonfinite_impulse_is_counted_and_never_accumulated(tmp_path):
         tmp_path, species, channels=["accounting"])
     accumulator = diagnostic.accumulators["electrons"]
 
-    lower = radiator.begin_momentum_push()
+    lower = tuple(
+        component.copy() for component in (species.ux, species.uy, species.uz))
     species.ux[0] = np.nan
     radiator.end_momentum_push(lower, 0.0)
     assert accumulator.completed_event_count == 1
@@ -669,10 +708,7 @@ def test_empty_population_records_interval_and_new_particle_waits_for_push(
         tmp_path, species, channels=["accounting"])
     accumulator = diagnostic.accumulators["electrons"]
 
-    empty_lower = radiator.begin_momentum_push()
-    assert empty_lower is not None
-    assert all(component.size == 0 for component in empty_lower)
-    radiator.end_momentum_push(empty_lower, 0.0)
+    radiator.end_momentum_push((species.ux, species.uy, species.uz), 0.0)
     assert accumulator.completed_event_count == 1
     assert accumulator.accounting["transverse_energy"][0] == 0.0
 
@@ -686,7 +722,9 @@ def test_empty_population_records_interval_and_new_particle_waits_for_push(
     species.uy = np.array([momentum[1]])
     species.uz = np.array([momentum[2]])
     species.w = np.array([1.0])
-    lower = radiator.begin_momentum_push()
+    species.tracker.id = np.array([17], dtype=np.uint64)
+    lower = tuple(
+        component.copy() for component in (species.ux, species.uy, species.uz))
     assert accumulator.accounting["transverse_energy"][0] == 0.0
     species.ux += 0.02
     radiator.end_momentum_push(lower, species.dt)
@@ -707,7 +745,7 @@ def test_stateless_packets_ignore_batching_and_particle_sorting(tmp_path):
         local_count = len(order)
         species = _species(
             u, [0.8e11, -0.1e11, 0.2e11], [0.0, 0.7e11, 0.0],
-            count=local_count, positions=ordered_positions,
+            count=local_count, positions=ordered_positions, particle_ids=order,
         )
         radiator = _activate(species)
         diagnostic = _diagnostic(
@@ -768,6 +806,7 @@ def test_stateless_packets_match_for_identical_cpu_and_gpu_events():
                     "x", "y", "z", "ux", "uy", "uz", "inv_gamma",
                     "w"):
                 setattr(species, name, cupy.asarray(getattr(species, name)))
+            species.tracker.id = cupy.asarray(species.tracker.id)
         radiator = _activate(species)
         accumulator = radiator.configure_observer_diagnostic(
             observer_frame="simulation",
@@ -778,7 +817,8 @@ def test_stateless_packets_match_for_identical_cpu_and_gpu_events():
             samples_per_particle=3, particle_batch_size=19,
             random_seed=8091,
         )
-        lower = radiator.begin_momentum_push()
+        lower = tuple(
+            component.copy() for component in (species.ux, species.uy, species.uz))
         species.ux += 0.03
         species.uy -= 0.02
         radiator.end_momentum_push(lower, 0.0)
@@ -858,7 +898,7 @@ def test_source_moments_remain_stable_at_large_coordinate_offset(tmp_path):
     assert components["rms_x"][0] > 0.0
 
 
-def test_dense_product_allocation_limit_is_enforced_and_exposed(tmp_path):
+def test_complete_allocation_limit_is_enforced_and_exposed(tmp_path):
     gamma = 20.0
     species = _species(
         [0.0, 0.0, math.sqrt(gamma**2 - 1.0)],
@@ -875,17 +915,88 @@ def test_dense_product_allocation_limit_is_enforced_and_exposed(tmp_path):
         )
     assert radiator.observer_accumulator is None
 
+    with pytest.raises(MemoryError, match="total radiation diagnostic"):
+        _diagnostic(
+            tmp_path / "complete_limit", species,
+            source_coordinate_edges={
+                "x": np.array([-1.0, 0.0, 1.0]),
+            },
+            source_projections=[{"name": "x", "axes": ("x",)}],
+            max_allocation_bytes=1024,
+        )
+    assert radiator.observer_accumulator is None
+
+    # A pathological aperture request must be rejected from its integer size
+    # estimate without first allocating the quadrature rays.
+    with pytest.raises(MemoryError, match="detector_aperture_quadrature"):
+        _diagnostic(
+            tmp_path / "quadrature_limit", species,
+            observer_time_edges=np.array([-1.0, 1.0]),
+            detectors=[{
+                "name": "huge", "direction": [0.0, 0.0, 1.0],
+                "half_angle": 1.0e-3,
+                "aperture_quadrature": 100_000_000,
+            }],
+            max_allocation_bytes=1024 * 1024,
+        )
+    assert radiator.observer_accumulator is None
+
     diagnostic = _diagnostic(
         tmp_path / "small", species,
         source_coordinate_edges={
             "x": np.array([-1.0, 0.0, 1.0]),
         },
         source_projections=[{"name": "x", "axes": ("x",)}],
-        max_allocation_bytes=1024,
+        max_allocation_bytes=64 * 1024,
     )
     accumulator = diagnostic.accumulators["electrons"]
     assert accumulator.estimated_dense_product_bytes == 16
     assert accumulator.allocation_breakdown["source/x"] == 16
+    assert accumulator.estimated_total_allocation_bytes > 16
+    assert "pusher_radiation_endpoint_buffer" in (
+        accumulator.allocation_breakdown)
+    assert "temporary_writer_snapshot_copies" in (
+        accumulator.allocation_breakdown)
+    assert "radiator_activation_spectral_table_copies" in (
+        accumulator.allocation_breakdown)
+    estimate = diagnostic.get_memory_estimate()["electrons"]
+    assert estimate["total_bytes"] == (
+        accumulator.estimated_total_allocation_bytes)
+
+
+def test_memory_preflight_precedes_automatic_identity_allocation(tmp_path):
+    species = _species(
+        [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0], count=3)
+    species.tracker = None
+    species.n_integer_quantities = 0
+    track_calls = []
+
+    def track(comm):
+        track_calls.append((comm.size, comm.rank))
+        species.tracker = SimpleNamespace(
+            id=np.arange(species.Ntot, dtype=np.uint64))
+        species.n_integer_quantities += 1
+
+    species.track = track
+    radiator = _activate(species)
+    with pytest.raises(MemoryError, match="total radiation diagnostic"):
+        _diagnostic(
+            tmp_path / "rejected", species, channels=["accounting"],
+            max_allocation_bytes=1)
+    assert track_calls == []
+    assert species.tracker is None
+    assert species.n_integer_quantities == 0
+    assert radiator.observer_accumulator is None
+
+    diagnostic = _diagnostic(
+        tmp_path / "accepted", species, channels=["accounting"],
+        max_allocation_bytes=64 * 1024)
+    assert track_calls == [(1, 0)]
+    assert species.n_integer_quantities == 1
+    assert species.tracker.id.tolist() == [0, 1, 2]
+    estimate = diagnostic.get_memory_estimate()["electrons"]["components"]
+    assert estimate["persistent_particle_identity"] == 3 * 8
 
 
 def test_detector_referenced_source_time_is_deterministic(tmp_path):
@@ -924,12 +1035,14 @@ def test_detector_referenced_source_time_is_deterministic(tmp_path):
 
     diagnostic.write_hdf5(1)
     with h5py.File(
-            tmp_path / "hdf5" / "data00000001.h5", "r") as output:
-        fields = output["data/1/fields"]
+            tmp_path / "hdf5" / "data00000000.h5", "r") as output:
+        fields = output["data/0/fields"]
         record = next(
             fields[name] for name in fields
             if "Source_detector_time" in name)
         assert _attribute_text(record.attrs["sourceTimeReference"]) == "D"
+        assert _attribute_text(record.attrs["sourceTimeConvention"]) == (
+            "fixed_detector_referenced_source_time")
         assert "tau_D" in _attribute_text(
             record.attrs["observerTimeDefinition"])
 
@@ -982,8 +1095,8 @@ def test_joint_band_is_angle_conditioned_and_fast_mode_is_explicit(tmp_path):
     _complete_impulse(fast_radiator, fast_species, 0.0)
     fast_diagnostic.write_hdf5(1)
     with h5py.File(
-            tmp_path / "fast" / "hdf5" / "data00000001.h5", "r") as output:
-        fields = output["data/1/fields"]
+            tmp_path / "fast" / "hdf5" / "data00000000.h5", "r") as output:
+        fields = output["data/0/fields"]
         record = next(
             fields[name] for name in fields
             if "ObserverTime_D_band_low_direction" in name)
@@ -1003,18 +1116,25 @@ def test_off_cadence_final_flush_writes_current_event(tmp_path):
         period=10, species={"electrons": species},
         comm=SimpleNamespace(rank=0, size=1),
         write_dir=str(tmp_path), channels=["accounting"],
+        particle_batch_size=1,
     )
     _complete_impulse(radiator, species, species.dt)
     diagnostic.write(1)
     assert not (tmp_path / "hdf5" / "data00000001.h5").exists()
     assert diagnostic.observer_writer.has_unwritten_events()
-    diagnostic.flush(1)
+    assert diagnostic.finalize()
+    assert not diagnostic.finalize()
+    assert not diagnostic.flush(999)
     assert not diagnostic.observer_writer.has_unwritten_events()
 
     with h5py.File(
             tmp_path / "hdf5" / "data00000001.h5", "r") as output:
         iteration = output["data/1"]
         assert iteration.attrs["radiationFinalFlush"] == 1
+        assert _attribute_text(
+            iteration.attrs["radiationWriteTrigger"]) == "explicit_finalization"
+        assert iteration.attrs[
+            "radiationLastIncludedEventIteration"] == 1
         fields = iteration["fields"]
         record = next(iter(fields.values()))
         assert record.attrs["finalFlush"] == 1
@@ -1044,12 +1164,17 @@ def test_simulation_post_impulse_phase_and_resumed_steps_do_not_collide(
     )
     simulation.diags = [diagnostic]
 
-    simulation.step(2, show_progress=False)
+    simulation.step(1, show_progress=False)
+    simulation.step(1, show_progress=False)
     assert simulation.iteration == 2
     assert diagnostic.accumulators[
         "electrons"].completed_event_count == 2
     assert (tmp_path / "hdf5" / "data00000000.h5").exists()
-    # Iteration 1 is an off-cadence final flush centered on event 1.
+    # Returning from either step(1) call does not force an off-cadence file.
+    assert diagnostic.observer_writer.has_unwritten_events()
+    assert not (tmp_path / "hdf5" / "data00000001.h5").exists()
+    assert simulation.finalize_diagnostics() == 1
+    assert simulation.finalize_diagnostics() == 0
     assert (tmp_path / "hdf5" / "data00000001.h5").exists()
 
     # Resuming starts with event center 2. Its scheduled output has a distinct
@@ -1059,3 +1184,262 @@ def test_simulation_post_impulse_phase_and_resumed_steps_do_not_collide(
     assert diagnostic.accumulators[
         "electrons"].completed_event_count == 3
     assert (tmp_path / "hdf5" / "data00000002.h5").exists()
+
+def test_resolution_indicators_and_energy_weighted_statistics(tmp_path):
+    lower_vector = np.array([0.0, 0.0, 20.0])
+    upper = np.array([
+        [0.15, 0.02, 20.0],
+        [0.8, -0.25, 19.7],
+    ])
+    gamma_minus = math.sqrt(1.0 + np.dot(lower_vector, lower_vector))
+    gamma_plus = np.sqrt(1.0 + np.sum(upper**2, axis=1))
+    lower = np.repeat(lower_vector[None, :], upper.shape[0], axis=0)
+    endpoint_dot = gamma_minus * gamma_plus - np.sum(lower * upper, axis=1)
+    expected_eta = np.arccosh(np.maximum(endpoint_dot, 1.0))
+    lower_norm = np.linalg.norm(lower, axis=1)
+    upper_norm = np.linalg.norm(upper, axis=1)
+    expected_theta = np.arccos(np.clip(
+        np.sum(lower * upper, axis=1) / (lower_norm * upper_norm),
+        -1.0, 1.0))
+    delta_u = upper - lower
+    delta_gamma = gamma_plus - gamma_minus
+    center_norm = np.sqrt(
+        4.0 + np.sum(delta_u**2, axis=1) - delta_gamma**2)
+    gamma_center = (gamma_plus + gamma_minus) / center_norm
+    expected_chi = gamma_center * expected_theta
+    expected = {
+        "delta_eta": expected_eta,
+        "delta_theta_u": expected_theta,
+        "chi_turn": expected_chi,
+    }
+    thresholds = {
+        name: 0.5 * (values.min() + values.max())
+        for name, values in expected.items()}
+
+    species = _species(
+        lower_vector, [0.0, 0.0, 0.0], [0.0, 4.0e10, 0.0],
+        count=2, particle_ids=np.array([101, 202], dtype=np.uint64))
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species, channels=["accounting"], output_mode="both",
+        resolution_warning_thresholds=thresholds)
+    accumulator = diagnostic.accumulators["electrons"]
+    lower_arrays = (
+        species.ux.copy(), species.uy.copy(), species.uz.copy())
+    species.ux[:] = upper[:, 0]
+    species.uy[:] = upper[:, 1]
+    species.uz[:] = upper[:, 2]
+    species.inv_gamma[:] = 1.0 / gamma_plus
+    event = accumulator._observer_event(
+        species, lower_arrays, 0.0, np, slice(None), event_index=0)
+    radiator.end_momentum_push(lower_arrays, 0.0)
+
+    resolution_energy = (
+        species.w * event["p_perp"] * event["dt_observer"])
+    denominator = resolution_energy.sum()
+    assert denominator > 0.0
+    for name, values in expected.items():
+        assert event[name] == pytest.approx(values, rel=2.0e-12, abs=1.0e-15)
+        state = accumulator.resolution_stats[name]
+        assert state[0] == pytest.approx(values.max(), rel=2.0e-12)
+        assert state[1] == pytest.approx(denominator, rel=2.0e-14)
+        assert state[2] / denominator == pytest.approx(
+            np.sum(resolution_energy * values) / denominator, rel=2.0e-12)
+        assert math.sqrt(state[3] / denominator) == pytest.approx(
+            math.sqrt(np.sum(resolution_energy * values**2) / denominator),
+            rel=2.0e-12)
+        assert state[4] / denominator == pytest.approx(
+            resolution_energy[values > thresholds[name]].sum() / denominator,
+            rel=2.0e-14)
+
+    diagnostic.write_hdf5(0)
+    with h5py.File(
+            tmp_path / "hdf5" / "data00000000.h5", "r") as output:
+        fields = output["data/0/fields"]
+        for mode in ("cumulative", "interval"):
+            prefix = "radiationEventQuality_electrons_%s_" % mode
+            assert fields[prefix + "max_delta_eta"][0] == pytest.approx(
+                expected_eta.max(), rel=2.0e-12)
+            assert fields[
+                prefix + "transverse_energy_weighted_rms_chi_turn"
+            ][0] > 0.0
+            fraction = fields[
+                prefix
+                + "transverse_energy_fraction_above_delta_theta_u_"
+                + "warning_threshold"
+            ][0]
+            expected_fraction = (
+                resolution_energy[
+                    expected_theta > thresholds["delta_theta_u"]].sum()
+                / denominator)
+            assert fraction == pytest.approx(expected_fraction, rel=2.0e-14)
+        quality = fields[
+            "radiationEventQuality_electrons_cumulative_max_delta_eta"]
+        assert quality.attrs["resolutionIndicatorsModifyEvents"] == 0
+        assert "exact_unthinned" in _attribute_text(
+            quality.attrs["resolutionWeighting"])
+
+
+def test_source_z_central_energy_intervals_are_mergeable_products(tmp_path):
+    count = 100
+    edges = np.linspace(-5.0, 5.0, count + 1)
+    positions = np.zeros((count, 3))
+    positions[:, 2] = 0.5 * (edges[:-1] + edges[1:])
+    species = _species(
+        [0.0, 0.0, 25.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0], count=count, positions=positions)
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species,
+        source_coordinate_edges={"z": edges},
+        source_moments=[{
+            "name": "all", "quantities": "position",
+        }],
+        source_z_intervals=(0.5, 0.9),
+        output_mode="both")
+    accumulator = diagnostic.accumulators["electrons"]
+    _complete_impulse(radiator, species, 0.0)
+
+    histogram = accumulator.source_z_histograms["all"]
+    moment_energy = accumulator.moment_stats["all"][0]
+    assert histogram.sum() == pytest.approx(moment_energy, rel=2.0e-14)
+    assert histogram[0] == 0.0
+    assert histogram[-1] == 0.0
+
+    diagnostic.write_hdf5(0)
+    with h5py.File(
+            tmp_path / "hdf5" / "data00000000.h5", "r") as output:
+        fields = output["data/0/fields"]
+        prefix = "radiationSourceMoments_all_electrons_cumulative_"
+        assert fields[prefix + "central_50_percent_z_start"][0] == (
+            pytest.approx(-2.5, abs=2.0e-14))
+        assert fields[prefix + "central_50_percent_z_end"][0] == (
+            pytest.approx(2.5, abs=2.0e-14))
+        assert fields[prefix + "central_90_percent_z_width"][0] == (
+            pytest.approx(9.0, abs=3.0e-14))
+        assert fields[prefix + "source_z_interval_contained_fraction"][0] == (
+            pytest.approx(1.0))
+        record = fields[prefix + "central_90_percent_z_width"]
+        assert np.asarray(
+            record.attrs["sourceZCentralIntervalFractions"]) == (
+                pytest.approx(np.array([0.5, 0.9])))
+        assert "equal_tail" in _attribute_text(
+            record.attrs["sourceZIntervalDefinition"])
+        interval_prefix = "radiationSourceMoments_all_electrons_interval_"
+        assert fields[
+            interval_prefix + "central_50_percent_z_width"
+        ][0] == pytest.approx(5.0, abs=3.0e-14)
+
+
+def test_scheduled_cadence_window_and_explicit_finalization_are_distinct(
+        tmp_path):
+    species = _species(
+        [0.0, 0.0, 24.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0])
+    radiator = _activate(species)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=2, iteration_min=2, iteration_max=4,
+        species={"electrons": species},
+        comm=SimpleNamespace(rank=0, size=1),
+        write_dir=str(tmp_path), channels=["accounting"],
+        output_mode="interval", particle_batch_size=1)
+
+    for event_index in range(5):
+        _complete_impulse(radiator, species, event_index * species.dt)
+        diagnostic.write(event_index)
+
+    output_dir = tmp_path / "hdf5"
+    assert not (output_dir / "data00000000.h5").exists()
+    assert not (output_dir / "data00000001.h5").exists()
+    assert (output_dir / "data00000002.h5").exists()
+    assert not (output_dir / "data00000003.h5").exists()
+    assert not (output_dir / "data00000004.h5").exists()
+    assert diagnostic.observer_writer.has_unwritten_events()
+
+    assert diagnostic.finalize()
+    assert not diagnostic.finalize()
+    assert (output_dir / "data00000004.h5").exists()
+    with h5py.File(output_dir / "data00000002.h5", "r") as output:
+        record = next(iter(output["data/2/fields"].values()))
+        assert record.attrs["representedEventCount"] == 3
+        assert _attribute_text(
+            output["data/2"].attrs["radiationWriteTrigger"]
+        ) == "scheduled_cadence"
+    with h5py.File(output_dir / "data00000004.h5", "r") as output:
+        record = next(iter(output["data/4/fields"].values()))
+        assert record.attrs["representedEventCount"] == 2
+        assert _attribute_text(
+            output["data/4"].attrs["radiationWriteTrigger"]
+        ) == "explicit_finalization"
+
+
+def test_bounded_endpoint_pusher_matches_unmodified_vay_push(tmp_path):
+    count = 9
+    batch_size = 3
+    species = _species(
+        [0.3, -0.2, 30.0], [0.8e11, -0.4e11, 0.2e11],
+        [0.1e11, 0.5e11, -0.2e11], count=count)
+    expected_ux = species.ux.copy()
+    expected_uy = species.uy.copy()
+    expected_uz = species.uz.copy()
+    expected_inv_gamma = species.inv_gamma.copy()
+    push_p_numba(
+        expected_ux, expected_uy, expected_uz, expected_inv_gamma,
+        species.Ex, species.Ey, species.Ez,
+        species.Bx, species.By, species.Bz,
+        species.q, species.m, species.Ntot, species.dt)
+
+    radiator = _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species, channels=["accounting"],
+        particle_batch_size=batch_size)
+    accumulator = diagnostic.accumulators["electrons"]
+    assert all(
+        array.size == batch_size
+        for array in accumulator.pusher_endpoint_buffer)
+    with pytest.raises(RuntimeError, match="full-species"):
+        radiator.begin_momentum_push()
+
+    species._push_p_with_radiation = lambda t, z_plane, event_index: (
+        Particles._push_p_with_radiation(
+            species, t, z_plane, event_index))
+    Particles.push_p(species, 0.5 * species.dt, event_index=0)
+    assert np.array_equal(species.ux, expected_ux)
+    assert np.array_equal(species.uy, expected_uy)
+    assert np.array_equal(species.uz, expected_uz)
+    assert np.array_equal(species.inv_gamma, expected_inv_gamma)
+    assert accumulator.completed_event_count == 1
+    assert accumulator.last_completed_event_index == 0
+
+def test_species_local_particle_ids_use_independent_random_namespaces(tmp_path):
+    first = _species(
+        [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0], particle_ids=np.array([7], dtype=np.uint64))
+    second = _species(
+        [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0], particle_ids=np.array([7], dtype=np.uint64))
+    _activate(first)
+    _activate(second)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=1,
+        species={"electrons_a": first, "electrons_b": second},
+        comm=SimpleNamespace(rank=0, size=1),
+        write_dir=str(tmp_path), channels=["accounting"],
+        particle_batch_size=1, random_seed=41,
+        max_allocation_bytes=128 * 1024)
+    first_accumulator = diagnostic.accumulators["electrons_a"]
+    second_accumulator = diagnostic.accumulators["electrons_b"]
+    assert first_accumulator.random_namespace != (
+        second_accumulator.random_namespace)
+
+    particle_id = np.array([7], dtype=np.uint64)
+    event_index = np.array([0], dtype=np.uint64)
+    first_sample = _event_uniform(
+        41, particle_id, event_index, _RANDOM_STREAM_PHOTON_ENERGY,
+        0, np, first_accumulator.random_namespace)
+    second_sample = _event_uniform(
+        41, particle_id, event_index, _RANDOM_STREAM_PHOTON_ENERGY,
+        0, np, second_accumulator.random_namespace)
+    assert first_sample[0] != second_sample[0]
+    assert diagnostic.estimated_total_allocation_bytes == sum(
+        item["total_bytes"] for item in diagnostic.memory_estimate.values())

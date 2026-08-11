@@ -18,7 +18,9 @@ from .injection import BallisticBeforePlane, ContinuousInjector, \
 
 # Load the numba methods
 from .push.numba_methods import push_p_numba, push_p_ioniz_numba, \
-                                push_p_after_plane_numba, push_x_numba
+        push_p_after_plane_numba, push_x_numba, \
+        push_p_with_endpoint_numba, push_p_ioniz_with_endpoint_numba, \
+        push_p_after_plane_with_endpoint_numba
 from .gathering.threading_methods import gather_field_numba_linear, \
         gather_field_numba_cubic
 from .gathering.threading_methods_one_mode import erase_eb_numba, \
@@ -36,7 +38,9 @@ if cuda_installed:
     import cupy
     from fbpic.utils.cuda import cuda_tpb_bpg_1d, cuda_gpu_model
     from .push.cuda_methods import push_p_gpu, push_p_ioniz_gpu, \
-                                push_p_after_plane_gpu, push_x_gpu
+        push_p_after_plane_gpu, push_x_gpu, push_p_with_endpoint_gpu, \
+        push_p_ioniz_with_endpoint_gpu, \
+        push_p_after_plane_with_endpoint_gpu
     from .deposition.cuda_methods import deposit_rho_gpu_linear, \
         deposit_J_gpu_linear, deposit_rho_gpu_cubic, deposit_J_gpu_cubic
     from .deposition.cuda_methods_one_mode import \
@@ -687,7 +691,79 @@ class Particles(object) :
             # Assign the old particle data array to the particle buffer
             self.int_sorting_buffer = particle_array
 
-    def push_p( self, t ) :
+    def _push_p_with_radiation(self, t, z_plane, event_index=None):
+        """Push and consume lower endpoints in fixed-capacity batches."""
+        radiator = self.synchrotron_radiator
+        endpoint = radiator.pusher_endpoint_buffer()
+        ux_minus, uy_minus, uz_minus = endpoint
+        batch_capacity = int(ux_minus.size)
+        simulation_time = float(t - 0.5*self.dt)
+        if event_index is None:
+            event_index = int(round(simulation_time / self.dt))
+
+        for start in range(0, self.Ntot, batch_capacity):
+            stop = min(start + batch_capacity, self.Ntot)
+            count = stop - start
+            if self.use_cuda:
+                dim_grid_1d, dim_block_1d = cuda_tpb_bpg_1d(count)
+                if self.ionizer is not None:
+                    push_p_ioniz_with_endpoint_gpu[
+                        dim_grid_1d, dim_block_1d](
+                            self.ux, self.uy, self.uz, self.inv_gamma,
+                            self.Ex, self.Ey, self.Ez,
+                            self.Bx, self.By, self.Bz,
+                            self.m, start, count, self.dt,
+                            self.ionizer.ionization_level,
+                            ux_minus, uy_minus, uz_minus)
+                elif z_plane is not None:
+                    push_p_after_plane_with_endpoint_gpu[
+                        dim_grid_1d, dim_block_1d](
+                            self.z, z_plane,
+                            self.ux, self.uy, self.uz, self.inv_gamma,
+                            self.Ex, self.Ey, self.Ez,
+                            self.Bx, self.By, self.Bz,
+                            self.q, self.m, start, count, self.dt,
+                            ux_minus, uy_minus, uz_minus)
+                else:
+                    push_p_with_endpoint_gpu[dim_grid_1d, dim_block_1d](
+                        self.ux, self.uy, self.uz, self.inv_gamma,
+                        self.Ex, self.Ey, self.Ez,
+                        self.Bx, self.By, self.Bz,
+                        self.q, self.m, start, count, self.dt,
+                        ux_minus, uy_minus, uz_minus)
+            elif self.ionizer is not None:
+                push_p_ioniz_with_endpoint_numba(
+                    self.ux, self.uy, self.uz, self.inv_gamma,
+                    self.Ex, self.Ey, self.Ez,
+                    self.Bx, self.By, self.Bz,
+                    self.m, start, count, self.dt,
+                    self.ionizer.ionization_level,
+                    ux_minus, uy_minus, uz_minus)
+            elif z_plane is not None:
+                push_p_after_plane_with_endpoint_numba(
+                    self.z, z_plane,
+                    self.ux, self.uy, self.uz, self.inv_gamma,
+                    self.Ex, self.Ey, self.Ez,
+                    self.Bx, self.By, self.Bz,
+                    self.q, self.m, start, count, self.dt,
+                    ux_minus, uy_minus, uz_minus)
+            else:
+                push_p_with_endpoint_numba(
+                    self.ux, self.uy, self.uz, self.inv_gamma,
+                    self.Ex, self.Ey, self.Ez,
+                    self.Bx, self.By, self.Bz,
+                    self.q, self.m, start, count, self.dt,
+                    ux_minus, uy_minus, uz_minus)
+            radiator.accumulate_pusher_batch(
+                slice(start, stop), count, simulation_time, event_index)
+
+        # Empty ranks still complete the same event. This preserves interval
+        # timing across MPI migration and keeps newly created particles out of
+        # an impulse that preceded their creation.
+        radiator.complete_momentum_push(simulation_time, event_index)
+
+
+    def push_p( self, t, event_index=None ) :
         """
         Advance the particles' momenta over one timestep, using the Vay pusher
         Reference : Vay, Physics of Plasmas 15, 056701 (2008)
@@ -701,6 +777,10 @@ class Particles(object) :
         t: float
             The current simulation time
             (Useful for particles that are ballistic before a given plane)
+
+        event_index: int, optional
+            Persistent simulation iteration for diagnostic random streams.
+            When omitted, it is inferred from the centered event time.
         """
         # Skip push for neutral particles (e.g. photons)
         if self.q == 0:
@@ -718,14 +798,12 @@ class Particles(object) :
         else:
             z_plane = None
 
-        # Capture the lower endpoint of the pusher impulse. The position is
-        # still at the integer-time center of this push. This capture is
-        # intentionally after all early validation and before the first
-        # in-place momentum update.
-        radiation_lower_momentum = None
-        if self.synchrotron_radiator is not None:
-            radiation_lower_momentum = \
-                self.synchrotron_radiator.begin_momentum_push()
+        # A configured radiation diagnostic streams lower endpoints from the
+        # pusher in bounded batches and consumes each batch before proceeding.
+        if (self.synchrotron_radiator is not None
+                and self.synchrotron_radiator.has_observer_diagnostic):
+            self._push_p_with_radiation(t, z_plane, event_index)
+            return
 
         # GPU (CUDA) version
         if self.use_cuda:
@@ -779,13 +857,6 @@ class Particles(object) :
                 push_p_numba(self.ux, self.uy, self.uz, self.inv_gamma,
                     self.Ex, self.Ey, self.Ez, self.Bx, self.By, self.Bz,
                     self.q, self.m, self.Ntot, self.dt )
-
-        # The upper momentum endpoint is now complete while position is still
-        # at integer time. The PIC loop passes the upper half-step time, so the
-        # centered event time is one half timestep earlier.
-        if self.synchrotron_radiator is not None:
-            self.synchrotron_radiator.end_momentum_push(
-                radiation_lower_momentum, t - 0.5*self.dt)
 
 
     def push_x( self, dt, x_push=1., y_push=1., z_push=1. ) :

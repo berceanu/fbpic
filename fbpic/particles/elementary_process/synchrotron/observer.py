@@ -13,6 +13,7 @@ openPMD writer.  This makes energy accounting independent of bin spacing.
 """
 
 import math
+from contextlib import nullcontext
 import re
 from functools import lru_cache
 
@@ -41,23 +42,50 @@ _SOURCE_STAT_SIZE = 1 + 2 * _SOURCE_VARIABLE_COUNT + (
     _SOURCE_VARIABLE_COUNT * (_SOURCE_VARIABLE_COUNT + 1) // 2)
 _UINT64_MASK = (1 << 64) - 1
 
+_DEFAULT_RESOLUTION_WARNING_THRESHOLDS = {
+    "delta_eta": 0.1,
+    "delta_theta_u": 0.01,
+    "chi_turn": 1.0,
+}
+_RESOLUTION_QUANTITIES = tuple(_DEFAULT_RESOLUTION_WARNING_THRESHOLDS)
+
 
 def _splitmix64(value, xp):
     """Vectorized SplitMix64 finalizer, identical with NumPy and CuPy."""
-    value = value + xp.uint64(0x9E3779B97F4A7C15)
-    value = (value ^ (value >> xp.uint64(30))) \
-        * xp.uint64(0xBF58476D1CE4E5B9)
-    value = (value ^ (value >> xp.uint64(27))) \
-        * xp.uint64(0x94D049BB133111EB)
+    overflow_context = np.errstate(over="ignore") if xp is np else nullcontext()
+    with overflow_context:
+        value = value + xp.uint64(0x9E3779B97F4A7C15)
+        value = (value ^ (value >> xp.uint64(30))) \
+            * xp.uint64(0xBF58476D1CE4E5B9)
+        value = (value ^ (value >> xp.uint64(27))) \
+            * xp.uint64(0x94D049BB133111EB)
     return value ^ (value >> xp.uint64(31))
 
 
-def _event_uniform(event_key, stream, xp):
-    """Return a stateless [0, 1) variate for a physical event and stream."""
-    stream_key = xp.uint64(
-        (int(stream) * 0xD2B74407B1CE6E93) & _UINT64_MASK)
-    bits = _splitmix64(event_key ^ stream_key, xp)
-    return (bits >> xp.uint64(11)).astype(xp.float64) * (1.0 / 2.0**53)
+# Stream identifiers are part of the public reproducibility contract. New
+# stochastic channels must receive a distinct identifier and never reuse one.
+_RANDOM_STREAM_PARTICLE_THINNING = 0x5458494E
+_RANDOM_STREAM_PHOTON_ENERGY = 0x454E4552
+_RANDOM_STREAM_ANGULAR_MAGNITUDE = 0x414E474D
+_RANDOM_STREAM_ANGULAR_SIGN = 0x414E4753
+
+
+def _event_uniform(
+        seed, particle_id, event_index, stream_id, sample_index, xp,
+        namespace=0):
+    """Return a stateless variate keyed only by persistent integer identity."""
+    key = xp.asarray(particle_id, dtype=xp.uint64)
+    fields = (seed, namespace, event_index, stream_id, sample_index)
+    salts = (
+        0x243F6A8885A308D3, 0x13198A2E03707344,
+        0xA4093822299F31D0, 0x082EFA98EC4E6C89,
+        0x452821E638D01377)
+    for value, salt in zip(fields, salts):
+        encoded = (
+            xp.asarray(value, dtype=xp.uint64)
+            + xp.uint64(salt & _UINT64_MASK))
+        key = _splitmix64(key ^ _splitmix64(encoded, xp), xp)
+    return (key >> xp.uint64(11)).astype(xp.float64) * (1.0 / 2.0**53)
 
 
 def _packed_upper_index(first, second, count=_SOURCE_VARIABLE_COUNT):
@@ -326,8 +354,6 @@ def _normalize_detector(
     quadrature = int(item.get("aperture_quadrature", 12))
     if quadrature < 1:
         raise ValueError("`aperture_quadrature` must be a positive integer.")
-    rays, ray_weights = _cone_quadrature(
-        direction, half_angle, quadrature)
     band_values = item.get("energy_bands", [])
     if isinstance(band_values, dict):
         band_values = [band_values]
@@ -349,8 +375,9 @@ def _normalize_detector(
         "direction": direction,
         "time_edges": time_edges,
         "half_angle": half_angle,
-        "rays": rays,
-        "ray_weights": ray_weights,
+        "aperture_quadrature": quadrature,
+        "rays": None,
+        "ray_weights": None,
         "energy_bands": bands,
         "energy_band_mode": energy_band_mode,
         "pulse_interval": (float(interval[0]), float(interval[1])),
@@ -453,13 +480,40 @@ class ObserverFrameRadiationAccumulator(object):
             angular_measure="solid_angle", detectors=None,
             observer_time_edges=None, source_coordinate_edges=None,
             source_projections=None, source_moments=None,
+            source_z_intervals=None, source_z_interval_edges=None,
             samples_per_particle=1, gamma_cutoff=10.0, particle_selection=None,
             particle_batch_size=262144, energy_band_mode="joint",
-            random_seed=0, particle_sampling_fraction=1.0,
-            max_allocation_bytes=1073741824):
+            random_seed=0, random_namespace=0, particle_sampling_fraction=1.0,
+            resolution_warning_thresholds=None,
+            output_mode="cumulative", mpi_size=1,
+            max_allocation_bytes=1073741824,
+            allocation_budget_bytes=None,
+            identity_tracking_will_be_activated=False,
+            identity_sorting_buffer_will_be_allocated=False):
         self.eon = radiating_species
+        tracker = getattr(radiating_species, "tracker", None)
+        if (tracker is None
+                and not identity_tracking_will_be_activated):
+            raise ValueError(
+                "Observer radiation requires persistent particle IDs. "
+                "Configure the diagnostic with a Particles species so that "
+                "tracking can be activated before accumulation.")
+        if (tracker is not None
+                and (not hasattr(tracker, "id")
+                     or int(tracker.id.size) != int(
+                         radiating_species.Ntot))):
+            raise ValueError(
+                "Persistent particle-ID and particle arrays have unequal sizes.")
+        self.identity_tracking_will_be_activated = bool(
+            identity_tracking_will_be_activated)
+        self.identity_sorting_buffer_will_be_allocated = bool(
+            identity_sorting_buffer_will_be_allocated)
         self.use_cuda = radiating_species.use_cuda
         self.dt_sim = float(dt_sim)
+        if output_mode not in ("cumulative", "interval", "both"):
+            raise ValueError("Unknown radiation output mode.")
+        self.output_mode = output_mode
+        self.mpi_size = max(1, int(mpi_size))
         self.observer_frame = str(observer_frame)
         if self.observer_frame == "lab":
             self.observer_frame = "laboratory"
@@ -544,12 +598,43 @@ class ObserverFrameRadiationAccumulator(object):
                 and random_seed != seed_integer:
             raise ValueError("random_seed must be an integer.")
         self.random_seed = seed_integer & _UINT64_MASK
+        self.random_namespace = int(random_namespace) & _UINT64_MASK
+        self.random_stream_ids = {
+            "particle_thinning": _RANDOM_STREAM_PARTICLE_THINNING,
+            "photon_energy": _RANDOM_STREAM_PHOTON_ENERGY,
+            "angular_magnitude": _RANDOM_STREAM_ANGULAR_MAGNITUDE,
+            "angular_sign": _RANDOM_STREAM_ANGULAR_SIGN,
+        }
         self.particle_sampling_fraction = float(
             particle_sampling_fraction)
         if (not math.isfinite(self.particle_sampling_fraction)
                 or not (0.0 < self.particle_sampling_fraction <= 1.0)):
             raise ValueError(
                 "particle_sampling_fraction must obey 0 < value <= 1.")
+
+        thresholds = dict(_DEFAULT_RESOLUTION_WARNING_THRESHOLDS)
+        if resolution_warning_thresholds is not None:
+            try:
+                supplied_thresholds = dict(resolution_warning_thresholds)
+            except (TypeError, ValueError):
+                raise ValueError(
+                    "resolution_warning_thresholds must be a mapping.")
+            unknown_thresholds = (
+                set(supplied_thresholds) - set(_RESOLUTION_QUANTITIES))
+            if unknown_thresholds:
+                raise ValueError(
+                    "Unknown pusher-resolution thresholds: %s"
+                    % ", ".join(sorted(unknown_thresholds)))
+            thresholds.update(supplied_thresholds)
+        for name, value in thresholds.items():
+            value = float(value)
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(
+                    "Resolution warning thresholds must be finite and "
+                    "nonnegative.")
+            thresholds[name] = value
+        self.resolution_warning_thresholds = thresholds
+
         if max_allocation_bytes is None:
             self.max_allocation_bytes = None
         else:
@@ -557,6 +642,13 @@ class ObserverFrameRadiationAccumulator(object):
             if self.max_allocation_bytes < 1:
                 raise ValueError(
                     "max_allocation_bytes must be positive or None.")
+        if allocation_budget_bytes is None:
+            self.allocation_budget_bytes = self.max_allocation_bytes
+        else:
+            self.allocation_budget_bytes = int(allocation_budget_bytes)
+            if self.allocation_budget_bytes < 1:
+                raise ValueError(
+                    "allocation_budget_bytes must be positive or None.")
         if angular_measure not in ("solid_angle", "projected_angles"):
             raise ValueError(
                 "`angular_measure` must be 'solid_angle' or "
@@ -573,7 +665,7 @@ class ObserverFrameRadiationAccumulator(object):
                 enabled_channels.append("observer_time")
             if source_projections:
                 enabled_channels.append("source")
-            if source_moments:
+            if source_moments or source_z_intervals:
                 enabled_channels.append("source_moments")
             enabled_channels.append("accounting")
         if isinstance(enabled_channels, str):
@@ -657,6 +749,30 @@ class ObserverFrameRadiationAccumulator(object):
         if self.common_time_edges is not None:
             available_edges["time"] = self.common_time_edges
         self.source_axis_edges = available_edges
+        if source_z_intervals is None:
+            source_z_intervals = ()
+        elif np.isscalar(source_z_intervals):
+            source_z_intervals = (source_z_intervals,)
+        normalized_intervals = tuple(
+            sorted(set(float(value) for value in source_z_intervals)))
+        if any(
+                not math.isfinite(value) or not (0.0 < value < 1.0)
+                for value in normalized_intervals):
+            raise ValueError(
+                "source_z_intervals must contain fractions strictly between "
+                "zero and one.")
+        if source_z_interval_edges is None:
+            source_z_interval_edges = available_edges.get("z")
+        self.source_z_intervals = normalized_intervals
+        self.source_z_interval_edges = (
+            None if source_z_interval_edges is None
+            else _as_edges(
+                source_z_interval_edges, "source_z_interval_edges"))
+        if self.source_z_intervals and self.source_z_interval_edges is None:
+            raise ValueError(
+                "Central source-z intervals require source_z_interval_edges "
+                "or source_coordinate_edges['z'].")
+
         projection_values = [] if source_projections is None \
             else source_projections
         if isinstance(projection_values, (dict, str)):
@@ -770,26 +886,40 @@ class ObserverFrameRadiationAccumulator(object):
         self.sampling = {}
         self.quality = {}
         self.interval_quality = {}
+        self.resolution_stats = {}
+        self.interval_resolution_stats = {}
         self.moment_stats = {}
         self.interval_moment_stats = {}
-        self.allocation_breakdown = self._estimate_dense_allocation()
-        self.estimated_dense_product_bytes = sum(
+        self.source_z_histograms = {}
+
+        dense_breakdown = self._estimate_dense_allocation()
+        self.estimated_dense_product_bytes = sum(dense_breakdown.values())
+        self.allocation_breakdown = self._estimate_total_allocation(
+            dense_breakdown)
+        self.estimated_total_allocation_bytes = sum(
             self.allocation_breakdown.values())
-        if (self.max_allocation_bytes is not None
-                and self.estimated_dense_product_bytes
-                > self.max_allocation_bytes):
+        if (self.allocation_budget_bytes is not None
+                and self.estimated_total_allocation_bytes
+                > self.allocation_budget_bytes):
             raise MemoryError(
-                "Requested dense radiation products require %d bytes, "
-                "exceeding max_allocation_bytes=%d. Breakdown: %s"
-                % (self.estimated_dense_product_bytes,
-                   self.max_allocation_bytes,
+                "Requested total radiation diagnostic footprint is %d bytes, "
+                "exceeding the available max_allocation_bytes budget of %d. "
+                "Breakdown: %s"
+                % (self.estimated_total_allocation_bytes,
+                   self.allocation_budget_bytes,
                    ", ".join("%s=%d" % item
                              for item in sorted(
                                  self.allocation_breakdown.items()))))
+
         self.completed_event_count = 0
+        self.last_completed_event_index = None
         self.cumulative_timing = self._empty_timing()
         self.interval_timing = self._empty_timing()
+        self._initialize_detector_quadratures()
         self._initialize_storage()
+        self.pusher_endpoint_buffer = tuple(
+            np.empty(self.particle_batch_size, dtype=np.float64)
+            for _ in range(3))
         self.angular_kernel_x = None
         self.angular_kernel_log_x = None
         self.angular_kernel_probability = None
@@ -805,6 +935,15 @@ class ObserverFrameRadiationAccumulator(object):
             self._initialize_joint_band_kernel()
         self._runtime = self._all_runtime_arrays()
         self._on_gpu = False
+
+    def _initialize_detector_quadratures(self):
+        """Allocate deterministic aperture rays after memory preflight."""
+        for detector in self.detectors:
+            rays, ray_weights = _cone_quadrature(
+                detector["direction"], detector["half_angle"],
+                detector["aperture_quadrature"])
+            detector["rays"] = rays
+            detector["ray_weights"] = ray_weights
 
     def _initialize_angular_kernel(self):
         """Tabulate the Schwinger vertical-angle conditional distribution.
@@ -832,15 +971,21 @@ class ObserverFrameRadiationAccumulator(object):
     def _empty_timing():
         return {
             "event_count": 0,
+            "first_event_index": np.iinfo(np.int64).max,
+            "last_event_index": np.iinfo(np.int64).min,
             "first_event_center": math.inf,
             "last_event_center": -math.inf,
             "represented_interval_start": math.inf,
             "represented_interval_end": -math.inf,
         }
 
-    def _record_event_timing(self, simulation_time):
+    def _record_event_timing(self, simulation_time, event_index):
         for timing in (self.cumulative_timing, self.interval_timing):
             timing["event_count"] += 1
+            timing["first_event_index"] = min(
+                timing["first_event_index"], event_index)
+            timing["last_event_index"] = max(
+                timing["last_event_index"], event_index)
             timing["first_event_center"] = min(
                 timing["first_event_center"], simulation_time)
             timing["last_event_center"] = max(
@@ -882,6 +1027,175 @@ class ObserverFrameRadiationAccumulator(object):
                 costs["source/" + projection["name"]] = (
                     math.prod(shape) * 8)
         return costs
+
+    def _estimate_total_allocation(self, dense_costs):
+        """Estimate peak resident and writer memory before product allocation.
+
+        The batch workspace count is deliberately conservative: vectorized
+        event construction keeps many simultaneous four-vector, power,
+        selection, histogram-index, and packet arrays.  Its size remains
+        bounded by particle_batch_size and never by the full species size.
+        """
+        costs = dict(dense_costs)
+        dense_bytes = sum(dense_costs.values())
+        selection_count = len(self.source_moment_selections)
+        moment_state_bytes = selection_count * _SOURCE_STAT_SIZE * 8
+        if moment_state_bytes:
+            costs["source_moment_cumulative_and_interval_state"] = (
+                2 * moment_state_bytes)
+
+        source_z_bytes = 0
+        if self.source_z_intervals:
+            source_z_bytes = (
+                selection_count
+                * int(self.source_z_interval_edges.size + 1) * 8)
+            costs["source_z_interval_histograms"] = source_z_bytes
+
+        aperture_count = sum(
+            detector["half_angle"] > 0.0 for detector in self.detectors)
+        accounting_slots = (
+            3 + (3 if self.energy_edges is not None else 0)
+            + (1 if "angular_spectral" in self.enabled_channels else 0)
+            + 4 * aperture_count + len(dense_costs))
+        sampling_slots = 8 + 2 * aperture_count
+        quality_and_resolution_slots = 2 * 3 + 2 * 3 * 5
+        timing_slots = 2 * 7
+        scalar_slots = (
+            accounting_slots + sampling_slots
+            + quality_and_resolution_slots + timing_slots)
+        costs["persistent_scalar_and_resolution_state"] = scalar_slots * 8
+        costs["persistent_python_state_overhead_estimate"] = (
+            1024 + 256 * (
+                len(self.detectors) + selection_count
+                + len(self.source_projections) + len(dense_costs)))
+
+        spectral_lookup = (
+            int(self.spectral_x.nbytes) + int(self.spectral_cdf.nbytes))
+        angular_runtime_lookup = 0
+        angular_cached_auxiliary = 0
+        lookup_construction_workspace = 0
+        if self.needs_angular_kernel:
+            angular_runtime_lookup = (96 + 96 + 257 + 96 * 257) * 8
+            angular_cached_auxiliary = 96 * 8
+            # q-grid plus Bessel, density, CDF, and interpolation work arrays.
+            lookup_construction_workspace += 16 * 1025 * 8
+        joint_lookup = 0
+        if self.needs_joint_band_model:
+            joint_lookup = (96 + 96 + 129 + 129 + 129 * 96) * 8
+            lookup_construction_workspace += (16 * 96 + 4 * 129) * 8
+        device_lookup_bytes = (
+            spectral_lookup + angular_runtime_lookup + joint_lookup)
+        costs["lookup_tables"] = (
+            device_lookup_bytes + angular_cached_auxiliary)
+        if lookup_construction_workspace:
+            costs["temporary_lookup_table_construction_workspace"] = (
+                lookup_construction_workspace)
+        radiator = getattr(self.eon, "synchrotron_radiator", None)
+        if radiator is not None:
+            costs["radiator_activation_spectral_table_copies"] = sum(
+                int(array.nbytes) for array in (
+                    radiator.spectral_x, radiator.spectral_cdf))
+
+        optional_axis_arrays = (
+            self.energy_edges, self.theta_x_edges, self.theta_y_edges,
+            self.common_time_edges)
+        configuration_arrays = [self.observer_translation]
+        configuration_arrays.extend(
+            array for array in optional_axis_arrays if array is not None)
+        configuration_arrays.extend(self.source_axis_edges.values())
+        if self.source_z_interval_edges is not None:
+            configuration_arrays.append(self.source_z_interval_edges)
+        detector_quadrature_bytes = 0
+        for detector in self.detectors:
+            configuration_arrays.extend((
+                detector["direction"], detector["time_edges"]))
+            ray_count = (
+                detector["aperture_quadrature"]
+                if detector["half_angle"] > 0.0 else 1)
+            detector_quadrature_bytes += ray_count * 4 * 8
+        # Several source axes can alias the primary axes on the host.
+        costs["detector_aperture_quadrature"] = detector_quadrature_bytes
+        configuration_bytes = 0
+        seen_arrays = set()
+        for array in configuration_arrays:
+            marker = id(array)
+            if marker not in seen_arrays:
+                configuration_bytes += int(array.nbytes)
+                seen_arrays.add(marker)
+        costs["configuration_and_axis_arrays"] = configuration_bytes
+
+        # Runtime dictionaries use distinct names for primary and source axes;
+        # their GPU conversion materializes every named entry.
+        runtime_configuration_bytes = sum(
+            int(array.nbytes) for array in optional_axis_arrays
+            if array is not None)
+        runtime_configuration_bytes += sum(
+            int(array.nbytes) for array in self.source_axis_edges.values())
+        if self.source_z_interval_edges is not None:
+            runtime_configuration_bytes += int(
+                self.source_z_interval_edges.nbytes)
+        runtime_configuration_bytes += detector_quadrature_bytes
+        for detector in self.detectors:
+            runtime_configuration_bytes += sum(
+                int(array.nbytes) for array in (
+                    detector["direction"], detector["time_edges"]))
+
+        batch = self.particle_batch_size
+        endpoint_buffer_bytes = 3 * batch * 8
+        costs["pusher_radiation_endpoint_buffer"] = endpoint_buffer_bytes
+        # 80 float, 12 integer, and 16 boolean vector slots cover the peak
+        # event dictionary, selection masks, indexed histogram coordinates,
+        # and reduction temporaries used by one vectorized batch.
+        costs["particle_batch_event_workspace"] = (
+            batch * (80 * 8 + 12 * 8 + 16))
+        if self.needs_spectral_samples:
+            packet_slots = 20 + max(1, aperture_count)
+            costs["spectral_angular_packet_workspace"] = (
+                batch * packet_slots * 8)
+        identity_bytes = int(self.eon.Ntot) * 8
+        costs["persistent_particle_identity"] = identity_bytes
+        if self.identity_sorting_buffer_will_be_allocated:
+            costs["particle_identity_sorting_buffer"] = identity_bytes
+
+        snapshot_moment_copies = moment_state_bytes
+        if self.output_mode in ("interval", "both"):
+            snapshot_moment_copies += moment_state_bytes
+        persistent_snapshot = (
+            dense_bytes + snapshot_moment_copies + source_z_bytes
+            + scalar_slots * 8)
+        costs["temporary_writer_snapshot_copies"] = persistent_snapshot
+        costs["temporary_writer_configuration_copies"] = configuration_bytes
+        if self.output_mode in ("interval", "both"):
+            costs["writer_interval_baseline"] = (
+                dense_bytes + source_z_bytes + scalar_slots * 8)
+            costs["temporary_writer_interval_difference"] = (
+                dense_bytes + source_z_bytes + scalar_slots * 8)
+        costs["temporary_writer_density_copy"] = (
+            max(dense_costs.values()) if dense_costs else 0)
+        if self.mpi_size > 1:
+            output_mode_count = 2 if self.output_mode == "both" else 1
+            reduced_snapshot = (
+                dense_bytes + moment_state_bytes + source_z_bytes
+                + scalar_slots * 8)
+            costs["reduction_buffers"] = (
+                output_mode_count * reduced_snapshot)
+            # Maxima, centered moments, and timing metadata use object
+            # gathers. Charge the root rank for the transient list and its
+            # serialized Python/NumPy payload in addition to the retained
+            # reduced snapshots above. One gather is live at a time.
+            gather_item_bytes = max(
+                _SOURCE_STAT_SIZE * 8 if selection_count else 0, 1024)
+            costs["temporary_mpi_object_gather_workspace"] = (
+                self.mpi_size * gather_item_bytes)
+        if self.use_cuda:
+            costs["device_runtime_array_copies"] = (
+                device_lookup_bytes + runtime_configuration_bytes)
+            costs["temporary_gpu_writer_transfer_copies"] = (
+                dense_bytes + 2 * moment_state_bytes + source_z_bytes
+                + scalar_slots * 8)
+            costs["temporary_gpu_initialization_transfer_copies"] = (
+                endpoint_buffer_bytes + identity_bytes)
+        return {key: int(value) for key, value in costs.items() if value > 0}
 
     def _initialize_joint_band_kernel(self):
         """Tabulate energy CDFs conditioned on Schwinger vertical angle."""
@@ -978,10 +1292,17 @@ class ObserverFrameRadiationAccumulator(object):
 
         if "source_moments" in self.enabled_channels:
             for selection in self.source_moment_selections:
-                self.moment_stats[selection["name"]] = np.zeros(
+                name = selection["name"]
+                self.moment_stats[name] = np.zeros(
                     _SOURCE_STAT_SIZE, dtype=np.float64)
-                self.interval_moment_stats[selection["name"]] = np.zeros(
+                self.interval_moment_stats[name] = np.zeros(
                     _SOURCE_STAT_SIZE, dtype=np.float64)
+                if self.source_z_intervals:
+                    # Underflow, interior bins, and overflow make the
+                    # interval coverage explicit instead of silently clipping.
+                    self.source_z_histograms[name] = np.zeros(
+                        self.source_z_interval_edges.size + 1,
+                        dtype=np.float64)
 
         for name in (
                 "max_mass_shell_relative_error",
@@ -989,6 +1310,13 @@ class ObserverFrameRadiationAccumulator(object):
                 "max_power_identity_relative_error"):
             self.quality[name] = np.zeros(1, dtype=np.float64)
             self.interval_quality[name] = np.zeros(1, dtype=np.float64)
+
+        # Per quantity: maximum, transverse-energy denominator, weighted
+        # first moment, weighted second moment, and energy above threshold.
+        for name in _RESOLUTION_QUANTITIES:
+            self.resolution_stats[name] = np.zeros(5, dtype=np.float64)
+            self.interval_resolution_stats[name] = np.zeros(
+                5, dtype=np.float64)
 
         for name in (
                 "invalid_pusher_events",
@@ -1000,6 +1328,15 @@ class ObserverFrameRadiationAccumulator(object):
                 "transverse_energy_sampling_variance",
                 "longitudinal_energy_sampling_variance"):
             self.sampling[name] = np.zeros(1, dtype=np.float64)
+        for detector in self.detectors:
+            if detector["half_angle"] <= 0.0:
+                continue
+            name = detector["name"]
+            for estimator in ("aperture", "outside_aperture"):
+                key = (
+                    "stochastic_spectral_angular_%s_energy_"
+                    "sampling_variance/%s" % (estimator, name))
+                self.sampling[key] = np.zeros(1, dtype=np.float64)
 
         base_accounting = [
             "transverse_energy", "longitudinal_energy",
@@ -1012,10 +1349,17 @@ class ObserverFrameRadiationAccumulator(object):
             ))
         if "angular_spectral" in self.enabled_channels:
             base_accounting.append("energy_outside_angular_grid")
-        if self.needs_spectral_samples and any(
-                detector["half_angle"] > 0.0
-                for detector in self.detectors):
-            base_accounting.append("energy_outside_apertures")
+        for detector in self.detectors:
+            if detector["half_angle"] <= 0.0:
+                continue
+            name = detector["name"]
+            base_accounting.extend((
+                "deterministic_broadband_aperture_energy/%s" % name,
+                "stochastic_spectral_angular_aperture_energy/%s" % name,
+                "stochastic_spectral_angular_outside_aperture_energy/%s"
+                % name,
+                "stochastic_spectral_angular_partition_energy/%s" % name,
+            ))
         for name in base_accounting:
             self.accounting[name] = np.zeros(1, dtype=np.float64)
         for key, kind in self.data_kinds.items():
@@ -1056,6 +1400,9 @@ class ObserverFrameRadiationAccumulator(object):
             or ("source_moments" in self.enabled_channels and any(
                 not selection["deterministic"]
                 for selection in self.source_moment_selections))
+            or any(
+                detector["half_angle"] > 0.0
+                for detector in self.detectors)
         )
 
     def _all_runtime_arrays(self):
@@ -1086,6 +1433,8 @@ class ObserverFrameRadiationAccumulator(object):
             arrays["time"] = self.common_time_edges
         for axis, edges in self.source_axis_edges.items():
             arrays["source_axis/%s" % axis] = edges
+        if self.source_z_interval_edges is not None:
+            arrays["source_z_interval_edges"] = self.source_z_interval_edges
         for detector in self.detectors:
             prefix = "detector/%s" % detector["name"]
             arrays[prefix + "/direction"] = detector["direction"]
@@ -1106,6 +1455,9 @@ class ObserverFrameRadiationAccumulator(object):
         self.interval_moment_stats = {
             key: cupy.asarray(value)
             for key, value in self.interval_moment_stats.items()}
+        self.source_z_histograms = {
+            key: cupy.asarray(value)
+            for key, value in self.source_z_histograms.items()}
         self.sampling = {key: cupy.asarray(value)
                          for key, value in self.sampling.items()}
         self.quality = {key: cupy.asarray(value)
@@ -1113,6 +1465,14 @@ class ObserverFrameRadiationAccumulator(object):
         self.interval_quality = {
             key: cupy.asarray(value)
             for key, value in self.interval_quality.items()}
+        self.resolution_stats = {
+            key: cupy.asarray(value)
+            for key, value in self.resolution_stats.items()}
+        self.interval_resolution_stats = {
+            key: cupy.asarray(value)
+            for key, value in self.interval_resolution_stats.items()}
+        self.pusher_endpoint_buffer = tuple(
+            cupy.asarray(value) for value in self.pusher_endpoint_buffer)
         self._runtime = {key: cupy.asarray(value)
                          for key, value in self._all_runtime_arrays().items()}
         self._on_gpu = True
@@ -1128,6 +1488,9 @@ class ObserverFrameRadiationAccumulator(object):
         self.interval_moment_stats = {
             key: value.get()
             for key, value in self.interval_moment_stats.items()}
+        self.source_z_histograms = {
+            key: value.get()
+            for key, value in self.source_z_histograms.items()}
         self.sampling = {
             key: value.get() for key, value in self.sampling.items()}
         self.quality = {
@@ -1135,6 +1498,12 @@ class ObserverFrameRadiationAccumulator(object):
         self.interval_quality = {
             key: value.get()
             for key, value in self.interval_quality.items()}
+        self.resolution_stats = {
+            key: value.get()
+            for key, value in self.resolution_stats.items()}
+        self.interval_resolution_stats = {
+            key: value.get()
+            for key, value in self.interval_resolution_stats.items()}
         self._runtime = self._all_runtime_arrays()
         self._on_gpu = False
 
@@ -1191,6 +1560,15 @@ class ObserverFrameRadiationAccumulator(object):
         xp.add.at(target.ravel(), selected_flat, selected_weights)
         return xp.sum(selected_weights)
 
+    def _source_z_add(self, target, z, weights, xp):
+        """Accumulate an interval histogram with explicit tail energy."""
+        edges = self._runtime["source_z_interval_edges"]
+        target[0] += xp.sum(weights[z < edges[0]])
+        target[-1] += xp.sum(weights[z > edges[-1]])
+        self._histogram_add(
+            target[1:-1], (z,), (edges,), weights, xp)
+
+
     def _selection_mask(self, selection, values, xp):
         reference = values.get("energy", next(iter(values.values())))
         mask = xp.ones(reference.shape, dtype=xp.bool_)
@@ -1225,33 +1603,27 @@ class ObserverFrameRadiationAccumulator(object):
             mask &= (value >= lower) & (value < upper)
         return mask
 
-    def _physical_event_key(
-            self, x_sim, y_sim, z_sim, ux_minus, uy_minus, uz_minus,
-            simulation_time, xp):
-        """Hash physical event coordinates without depending on array order."""
-        key = xp.full(
-            x_sim.shape, xp.uint64(self.random_seed), dtype=xp.uint64)
-        values = (x_sim, y_sim, z_sim, ux_minus, uy_minus, uz_minus)
-        for index, value in enumerate(values):
-            canonical = xp.asarray(value + 0.0, dtype=xp.float64)
-            bits = canonical.view(xp.uint64)
-            salt = xp.uint64(
-                ((index + 1) * 0x9E3779B97F4A7C15) & _UINT64_MASK)
-            key = _splitmix64(key ^ _splitmix64(bits ^ salt, xp), xp)
-        event_index = int(round(float(simulation_time) / self.dt_sim))
-        key ^= xp.uint64(event_index & _UINT64_MASK)
-        return _splitmix64(key, xp)
-
     def _observer_event(
             self, eon, lower_momentum, simulation_time, xp,
-            particle_slice=None):
+            particle_slice=None, batch_count=None, event_index=None):
         """Construct and covariantly transform one centered pusher impulse."""
         if particle_slice is None:
             particle_slice = slice(None)
+        if event_index is None:
+            event_index = int(round(float(simulation_time) / self.dt_sim))
 
-        ux_minus = lower_momentum[0][particle_slice]
-        uy_minus = lower_momentum[1][particle_slice]
-        uz_minus = lower_momentum[2][particle_slice]
+        # Production coupling buffers are batch-local, whereas explicitly
+        # supplied compatibility endpoints may span the complete species.
+        if batch_count is None:
+            if int(lower_momentum[0].size) == int(eon.Ntot):
+                lower_slice = particle_slice
+            else:
+                lower_slice = slice(None)
+        else:
+            lower_slice = slice(0, int(batch_count))
+        ux_minus = lower_momentum[0][lower_slice]
+        uy_minus = lower_momentum[1][lower_slice]
+        uz_minus = lower_momentum[2][lower_slice]
         ux_plus = eon.ux[particle_slice]
         uy_plus = eon.uy[particle_slice]
         uz_plus = eon.uz[particle_slice]
@@ -1284,6 +1656,28 @@ class ObserverFrameRadiationAccumulator(object):
         ux_sim = (ux_plus + ux_minus) / center_norm
         uy_sim = (uy_plus + uy_minus) / center_norm
         uz_sim = (uz_plus + uz_minus) / center_norm
+
+        # Observer-independent endpoint resolution indicators.  The rapidity
+        # form avoids arcosh(1 + epsilon) cancellation for small impulses.
+        relative_spacelike2 = xp.maximum(
+            delta_ux**2 + delta_uy**2 + delta_uz**2 - delta_gamma**2,
+            0.0)
+        delta_eta = 2.0 * xp.arcsinh(
+            0.5 * xp.sqrt(relative_spacelike2))
+        momentum_minus = xp.sqrt(
+            ux_minus**2 + uy_minus**2 + uz_minus**2)
+        momentum_plus = xp.sqrt(
+            ux_plus**2 + uy_plus**2 + uz_plus**2)
+        direction_denominator = momentum_minus * momentum_plus
+        direction_cosine = (
+            ux_minus * ux_plus + uy_minus * uy_plus + uz_minus * uz_plus)
+        direction_cosine = direction_cosine / xp.where(
+            direction_denominator > 0.0, direction_denominator, 1.0)
+        delta_theta_u = xp.where(
+            direction_denominator > 0.0,
+            xp.arccos(xp.clip(direction_cosine, -1.0, 1.0)),
+            0.0)
+        chi_turn = gamma_sim * delta_theta_u
 
         delta_tau = self.dt_sim / gamma_sim
         acceleration_scale = c / delta_tau
@@ -1362,9 +1756,11 @@ class ObserverFrameRadiationAccumulator(object):
         x_sim = eon.x[particle_slice]
         y_sim = eon.y[particle_slice]
         z_sim = eon.z[particle_slice]
-        event_key = self._physical_event_key(
-            x_sim, y_sim, z_sim, ux_minus, uy_minus, uz_minus,
-            simulation_time, xp)
+        particle_id = xp.asarray(
+            eon.tracker.id[particle_slice], dtype=xp.uint64)
+        event_index_array = xp.full(
+            particle_id.shape, xp.uint64(event_index & _UINT64_MASK),
+            dtype=xp.uint64)
 
         ct_sim = c * float(simulation_time)
         # Transform both observer light-front coordinates and apply the
@@ -1431,7 +1827,11 @@ class ObserverFrameRadiationAccumulator(object):
             "time": time_observer,
             "ct_plus_z": ct_plus_z_observer,
             "ct_minus_z": ct_minus_z_observer,
-            "event_key": event_key,
+            "particle_id": particle_id,
+            "event_index": event_index_array,
+            "delta_eta": delta_eta,
+            "delta_theta_u": delta_theta_u,
+            "chi_turn": chi_turn,
             "mass_shell_error": mass_shell_error,
             "mass_shell_relative_error": mass_shell_relative_error,
             "u_dot_a_sim": u_dot_a_sim,
@@ -1606,6 +2006,9 @@ class ObserverFrameRadiationAccumulator(object):
                 ray_energy = (
                     ray_power * ray_weights[ray_index] * event["weight"]
                     * event["dt_observer"])
+                self.accounting[
+                    "deterministic_broadband_aperture_energy/%s"
+                    % name][0] += xp.sum(ray_energy)
                 ray_tau = self._retarded_time(event, ray)
                 represented = self._histogram_add(
                     self.data[aperture_key], (ray_tau,), (time_edges,),
@@ -1665,7 +2068,9 @@ class ObserverFrameRadiationAccumulator(object):
             log_grid[x_upper] - log_grid[x_lower])
 
         random_probability = _event_uniform(
-            event["event_key"], 3*sample_index + 1, xp)
+            self.random_seed, event["particle_id"], event["event_index"],
+            _RANDOM_STREAM_ANGULAR_MAGNITUDE, sample_index, xp,
+            self.random_namespace)
         probability_position = random_probability * (inverse.shape[1] - 1)
         p_lower = xp.floor(probability_position).astype(xp.int64)
         p_lower = xp.clip(p_lower, 0, inverse.shape[1] - 2)
@@ -1678,8 +2083,11 @@ class ObserverFrameRadiationAccumulator(object):
         y = q / x_safe**(1.0 / 3.0)
         psi = xp.minimum(y * event["inv_gamma"], 0.5 * math.pi)
         sign = xp.where(
-            _event_uniform(event["event_key"], 3*sample_index + 2, xp)
-            < 0.5, -1.0, 1.0)
+            _event_uniform(
+                self.random_seed, event["particle_id"],
+                event["event_index"], _RANDOM_STREAM_ANGULAR_SIGN,
+                sample_index, xp, self.random_namespace) < 0.5,
+            -1.0, 1.0)
         sin_psi = sign * xp.sin(psi)
         cos_psi = xp.cos(psi)
         return (
@@ -1779,7 +2187,8 @@ class ObserverFrameRadiationAccumulator(object):
         return conditioned
 
     def _accumulate_sample(
-            self, event, scaled_energy, packet_weight, xp, sample_index):
+            self, event, scaled_energy, packet_weight, xp, sample_index,
+            aperture_hits=None):
         nx, ny, nz = self._sample_direction(
             event, scaled_energy, xp, sample_index)
         photon_direction = (nx, ny, nz)
@@ -1808,21 +2217,29 @@ class ObserverFrameRadiationAccumulator(object):
             self.accounting["energy_outside_angular_grid"][0] += xp.sum(
                 packet_weight[~inside_angle])
 
-        apertures = [
-            detector for detector in self.detectors
-            if "observer_time" in self.enabled_channels
-            and detector["half_angle"] > 0.0
-        ]
-        if apertures and "energy_outside_apertures" in self.accounting:
-            inside_any = xp.zeros(packet_weight.shape, dtype=xp.bool_)
-            for detector in apertures:
-                direction = detector["direction"]
-                inside_any |= (
-                    nx * direction[0] + ny * direction[1]
-                    + nz * direction[2]
-                ) >= math.cos(detector["half_angle"])
-            self.accounting["energy_outside_apertures"][0] += xp.sum(
-                packet_weight[~inside_any])
+        for detector in self.detectors:
+            if detector["half_angle"] <= 0.0:
+                continue
+            name = detector["name"]
+            direction = self._runtime[
+                "detector/%s/direction" % name]
+            inside = (
+                nx * direction[0] + ny * direction[1]
+                + nz * direction[2]
+            ) >= math.cos(detector["half_angle"])
+            inside_energy = xp.sum(packet_weight[inside])
+            outside_energy = xp.sum(packet_weight[~inside])
+            self.accounting[
+                "stochastic_spectral_angular_aperture_energy/%s"
+                % name][0] += inside_energy
+            self.accounting[
+                "stochastic_spectral_angular_outside_aperture_energy/%s"
+                % name][0] += outside_energy
+            self.accounting[
+                "stochastic_spectral_angular_partition_energy/%s"
+                % name][0] += inside_energy + outside_energy
+            if aperture_hits is not None:
+                aperture_hits[name] += inside.astype(xp.float64)
 
         if "source" in self.enabled_channels:
             for projection in self.source_projections:
@@ -1861,6 +2278,12 @@ class ObserverFrameRadiationAccumulator(object):
                     self._update_moments(
                         storage[selection["name"]], selected_values,
                         packet_weight[selected], selection["quantities"], xp)
+                if selection["name"] in self.source_z_histograms:
+                    self._source_z_add(
+                        self.source_z_histograms[selection["name"]],
+                        conditioned["z"][selected],
+                        packet_weight[selected], xp)
+
 
     def _accumulate_coordinate_products(self, event, w_perp, xp):
         """Accumulate source products that need no stochastic photon packet."""
@@ -1911,12 +2334,18 @@ class ObserverFrameRadiationAccumulator(object):
                     self._update_moments(
                         storage[selection["name"]], selected_values,
                         w_perp[selected], selection["quantities"], xp)
+                if selection["name"] in self.source_z_histograms:
+                    self._source_z_add(
+                        self.source_z_histograms[selection["name"]],
+                        conditioned["z"][selected], w_perp[selected], xp)
+
 
     def _accumulate_batch(
-            self, lower_momentum, particle_slice, simulation_time, xp):
+            self, lower_momentum, particle_slice, simulation_time, xp,
+            batch_count=None, event_index=None):
         event = self._observer_event(
             self.eon, lower_momentum, float(simulation_time), xp,
-            particle_slice)
+            particle_slice, batch_count=batch_count, event_index=event_index)
         finite_event = xp.ones(event["gamma"].shape, dtype=xp.bool_)
         for name in (
                 "gamma", "ux", "uy", "uz",
@@ -1926,6 +2355,7 @@ class ObserverFrameRadiationAccumulator(object):
                 "dot_beta_x", "dot_beta_y", "dot_beta_z",
                 "p_perp", "p_parallel", "invariant_power", "omega_c",
                 "delta_tau", "dt_observer", "weight",
+                "delta_eta", "delta_theta_u", "chi_turn",
                 "x", "y", "z", "time", "ct_plus_z", "ct_minus_z"):
             finite_event &= xp.isfinite(event[name])
         finite_event &= event["delta_tau"] > 0.0
@@ -1967,10 +2397,30 @@ class ObserverFrameRadiationAccumulator(object):
         self.sampling["physical_macroparticle_weight"][0] += xp.sum(
             physical_weight)
 
+        resolution_energy = (
+            physical_weight * eligible["p_perp"]
+            * eligible["dt_observer"])
+        for name in _RESOLUTION_QUANTITIES:
+            values = eligible[name]
+            threshold = self.resolution_warning_thresholds[name]
+            for storage in (
+                    self.resolution_stats,
+                    self.interval_resolution_stats):
+                state = storage[name]
+                if values.size:
+                    state[0] = xp.maximum(state[0], xp.max(values))
+                state[1] += xp.sum(resolution_energy)
+                state[2] += xp.sum(resolution_energy * values)
+                state[3] += xp.sum(resolution_energy * values**2)
+                state[4] += xp.sum(
+                    resolution_energy[values > threshold])
+
         probability = self.particle_sampling_fraction
         if probability < 1.0:
             keep = _event_uniform(
-                eligible["event_key"], 0x5458494E, xp) < probability
+                self.random_seed, eligible["particle_id"],
+                eligible["event_index"], _RANDOM_STREAM_PARTICLE_THINNING,
+                0, xp, self.random_namespace) < probability
         else:
             keep = xp.ones(physical_weight.shape, dtype=xp.bool_)
         event = self._filtered(eligible, keep)
@@ -2033,9 +2483,17 @@ class ObserverFrameRadiationAccumulator(object):
 
         if not self.needs_spectral_samples:
             return
+        aperture_hits = {
+            detector["name"]: xp.zeros(
+                spectral_weight.shape, dtype=xp.float64)
+            for detector in self.detectors
+            if detector["half_angle"] > 0.0
+        }
         for sample_index in range(self.samples_per_particle):
             jitter = _event_uniform(
-                spectral_event["event_key"], 3*sample_index, xp)
+                self.random_seed, spectral_event["particle_id"],
+                spectral_event["event_index"], _RANDOM_STREAM_PHOTON_ENERGY,
+                sample_index, xp, self.random_namespace)
             spectral_probability = (
                 (sample_index + jitter) / self.samples_per_particle
                 * retained_fraction)
@@ -2045,24 +2503,85 @@ class ObserverFrameRadiationAccumulator(object):
                 / self.samples_per_particle)
             self._accumulate_sample(
                 spectral_event, scaled_energy, packet_weight, xp,
-                sample_index)
+                sample_index, aperture_hits=aperture_hits)
 
-    def accumulate_impulse(self, lower_momentum, simulation_time=0.0):
-        """Accumulate one completed pusher impulse in bounded batches."""
+        total_packet_energy = spectral_weight * retained_fraction
+        for name, hits in aperture_hits.items():
+            probability_estimate = hits / self.samples_per_particle
+            if self.samples_per_particle > 1:
+                packet_variance = (
+                    total_packet_energy**2
+                    * probability_estimate * (1.0 - probability_estimate)
+                    / (self.samples_per_particle - 1))
+            else:
+                # With one packet there is no within-event replicate. Report
+                # the conservative Bernoulli upper bound rather than a false
+                # zero uncertainty.
+                packet_variance = 0.25 * total_packet_energy**2
+            estimates = {
+                "aperture": total_packet_energy * probability_estimate,
+                "outside_aperture": total_packet_energy
+                * (1.0 - probability_estimate),
+            }
+            thinning_probability = self.particle_sampling_fraction
+            for estimator, estimate in estimates.items():
+                # Combine within-event packet variance with the Bernoulli
+                # Horvitz-Thompson contribution from particle thinning. This
+                # reduces to packet variance when all particles are retained.
+                variance = (
+                    thinning_probability * packet_variance
+                    + (1.0 - thinning_probability) * estimate**2)
+                key = (
+                    "stochastic_spectral_angular_%s_energy_"
+                    "sampling_variance/%s" % (estimator, name))
+                self.sampling[key][0] += xp.sum(variance)
+
+    def accumulate_impulse_batch(
+            self, lower_momentum, particle_slice, batch_count,
+            simulation_time, event_index):
+        """Consume one pusher-owned endpoint batch immediately."""
+        if lower_momentum is None or len(lower_momentum) != 3:
+            raise ValueError(
+                "A pusher impulse requires three lower momentum arrays.")
+        batch_count = int(batch_count)
+        if batch_count < 0 or any(
+                int(array.size) < batch_count for array in lower_momentum):
+            raise ValueError("The pusher endpoint batch is undersized.")
+        self._accumulate_batch(
+            lower_momentum, particle_slice, simulation_time, self._xp(),
+            batch_count=batch_count, event_index=int(event_index))
+
+    def complete_impulse(self, simulation_time, event_index):
+        """Complete one streamed event, recording timing exactly once."""
+        event_index = int(event_index)
+        if (self.last_completed_event_index is not None
+                and event_index <= self.last_completed_event_index):
+            raise RuntimeError(
+                "Radiation pusher events must complete once in increasing "
+                "event-index order.")
+        self._record_event_timing(float(simulation_time), event_index)
+        self.completed_event_count += 1
+        self.last_completed_event_index = event_index
+
+    def accumulate_impulse(
+            self, lower_momentum, simulation_time=0.0, event_index=None):
+        """Compatibility path for caller-owned complete endpoint arrays."""
         if lower_momentum is None or len(lower_momentum) != 3:
             raise ValueError(
                 "A pusher impulse requires three lower momentum arrays.")
         particle_count = int(self.eon.Ntot)
-        if any(array.size != particle_count for array in lower_momentum):
+        if any(int(array.size) != particle_count for array in lower_momentum):
             raise ValueError(
                 "Pusher endpoint arrays changed before radiation accumulation.")
+        if event_index is None:
+            event_index = int(round(float(simulation_time) / self.dt_sim))
         xp = self._xp()
         for start in range(0, particle_count, self.particle_batch_size):
             stop = min(start + self.particle_batch_size, particle_count)
             self._accumulate_batch(
-                lower_momentum, slice(start, stop), simulation_time, xp)
-        self._record_event_timing(float(simulation_time))
-        self.completed_event_count += 1
+                lower_momentum, slice(start, stop), simulation_time, xp,
+                event_index=event_index)
+        self.complete_impulse(simulation_time, event_index)
 
     def accumulate(self, simulation_time=0.0):
         """Reject accumulation without explicit pusher endpoints."""
@@ -2081,6 +2600,9 @@ class ObserverFrameRadiationAccumulator(object):
                 "quality": {
                     key: value.copy()
                     for key, value in self.interval_quality.items()},
+                "resolution": {
+                    key: value.copy()
+                    for key, value in self.interval_resolution_stats.items()},
                 "moments": {
                     key: value.copy()
                     for key, value in self.interval_moment_stats.items()},
@@ -2092,8 +2614,14 @@ class ObserverFrameRadiationAccumulator(object):
                 key: value.copy() for key, value in self.accounting.items()},
             "sampling": {
                 key: value.copy() for key, value in self.sampling.items()},
+            "source_z": {
+                key: value.copy()
+                for key, value in self.source_z_histograms.items()},
             "quality": {
                 key: value.copy() for key, value in self.quality.items()},
+            "resolution": {
+                key: value.copy()
+                for key, value in self.resolution_stats.items()},
             "moments": {
                 key: value.copy()
                 for key, value in self.moment_stats.items()},
@@ -2105,6 +2633,8 @@ class ObserverFrameRadiationAccumulator(object):
         for stats in self.interval_moment_stats.values():
             stats.fill(0.0)
         for value in self.interval_quality.values():
+            value.fill(0.0)
+        for value in self.interval_resolution_stats.values():
             value.fill(0.0)
         self.interval_timing = self._empty_timing()
 
