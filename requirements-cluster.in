@@ -1,6 +1,6 @@
-# Reproducible single-process H100 FBPIC + SynchRad environment.
+# Reproducible multi-process H100 cluster FBPIC + SynchRad environment.
 # Compile from this directory with:
-#   uv pip compile requirements-h100.in -o requirements-h100.lock --python-version 3.12 --python-platform linux
+#   uv pip compile requirements-cluster.in -o requirements-cluster.lock --python-version 3.12 --python-platform linux
 
 -e .
 -e ../synchrad
