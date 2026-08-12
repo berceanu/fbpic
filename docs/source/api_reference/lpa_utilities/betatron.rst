@@ -187,6 +187,10 @@ openPMD energy and angular coordinates are laboratory coordinates.  The
 file time remains the simulation-frame time, and an intermediate cumulative
 output generally ends at different laboratory times along different
 particle worldlines; it is not a laboratory simultaneity snapshot.
+Each radiation dataset records this contract explicitly through its
+``observerFrame``, boost, angular-coordinate and density-measure,
+photon-energy, laboratory gamma-threshold, field-acceleration, spectral-model,
+macroparticle-closure, and cumulative-accumulation attributes.
 
 For example, in a boosted simulation use
 

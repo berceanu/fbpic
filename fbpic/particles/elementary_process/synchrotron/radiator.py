@@ -101,6 +101,7 @@ class SynchrotronRadiator(object):
                 "Radiation reaction is not supported with boosted-frame "
                 "synchrotron radiation.")
 
+        self.gamma_cutoff = gamma_cutoff
         self.gamma_cutoff_inv = 1. / gamma_cutoff
         self.radiation_reaction = radiation_reaction
 

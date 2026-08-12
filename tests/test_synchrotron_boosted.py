@@ -1271,6 +1271,8 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
         d_omega=(8.0e-16 - 2.0e-16) / (3.0 * hbar),
         theta_x_min=-0.12, theta_y_min=0.03,
         omega_min=2.0e-16 / hbar,
+        gamma_boost=4.0, beta_boost=np.sqrt(15.0 / 16.0),
+        gamma_cutoff=125.0, radiation_reaction=False,
         radiation_data=np.arange(140, dtype=np.float64).reshape(5, 7, 4)
     )
     species = SimpleNamespace(synchrotron_radiator=radiator)
@@ -1309,6 +1311,39 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
         assert list(dataset.attrs["axisLabels"]) == [b"x", b"y", b"z"]
         assert dataset.attrs["dataOrder"] == np.bytes_("C")
         assert dataset.attrs["geometry"] == np.bytes_("cartesian")
+        expected_metadata = {
+            "longName": (
+                b"laboratory-frame spectral-angular radiation energy density"
+            ),
+            "radiationProduct": b"angular_spectral_energy_density",
+            "observerFrame": b"laboratory",
+            "angularMeasure": b"projected_angles",
+            "angularDensityMeasure": (
+                b"per_projected_angle_measure_dtheta_x_dtheta_y"
+            ),
+            "angularCoordinateConvention": (
+                b"theta_x=atan2(n_x,n_z);theta_y=atan2(n_y,n_z)"
+            ),
+            "photonEnergyDefinition": b"E_photon=hbar*omega_observer",
+            "gammaThresholdFrame": b"laboratory",
+            "accelerationSource": b"Lorentz_force_from_gathered_EB_fields",
+            "picEventTimeStaggering": (
+                b"integer_time_gathered_fields_with_half_step_momentum"
+            ),
+            "spectralModel": b"normalized_classical_synchrotron_curvature",
+            "localAngularModel": (
+                b"stochastic_gaussian_ultrarelativistic_cone"
+            ),
+            "macroparticleClosure": b"incoherent_linear_in_weight",
+            "accumulationMode": b"cumulative",
+        }
+        for key, expected in expected_metadata.items():
+            assert dataset.attrs[key] == np.bytes_(expected)
+        assert dataset.attrs["observerFrameGamma"] == 4.0
+        assert dataset.attrs["observerFrameBeta"] == np.sqrt(15.0 / 16.0)
+        assert dataset.attrs["gammaThreshold"] == 125.0
+        assert dataset.attrs["cumulative"] == np.uint32(1)
+        assert dataset.attrs["radiationReaction"] == np.uint32(0)
 
     timeseries = OpenPMDTimeSeries(str(tmp_path / "hdf5"))
     assert np.array_equal(timeseries.iterations, [3, 6])

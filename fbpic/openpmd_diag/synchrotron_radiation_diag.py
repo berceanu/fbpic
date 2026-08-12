@@ -221,14 +221,18 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             field_grp = f.require_group(field_path)
 
             for specie_name in self.species_names:
+                radiator = self.species[specie_name].synchrotron_radiator
                 dset = field_grp.require_dataset(
                     f"radiation_{specie_name}", self.mesh_shape, dtype='f8')
                 # Setup the record and the component to which it belongs
-                self.setup_openpmd_mesh_component_record( dset, "radiation" )
+                self.setup_openpmd_mesh_component_record(
+                    dset, "radiation", radiator )
             # Close the file
             f.close()
 
-    def setup_openpmd_mesh_component_record( self, dset, quantity ) :
+    def setup_openpmd_mesh_component_record(
+        self, dset, quantity, radiator
+    ) :
         """
         Sets the attributes that are specific to a mesh record
 
@@ -238,6 +242,9 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
 
         quantity : string
            The name of the record (e.g. "radiation")
+
+        radiator : SynchrotronRadiator
+            The radiator whose configuration describes this dataset.
         """
         # Generic record attributes
         self.setup_openpmd_record( dset, quantity )
@@ -252,6 +259,40 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         dset.attrs["dataOrder"] = np.bytes_("C")
         dset.attrs["gridUnitSI"] = 1.
         dset.attrs["fieldSmoothing"] = np.bytes_("none")
+
+        # Radiation-specific semantics. The generic x/y/z labels above are
+        # retained for openPMD-viewer compatibility; these attributes state
+        # the physical coordinates and frame unambiguously.
+        dset.attrs["longName"] = np.bytes_(
+            "laboratory-frame spectral-angular radiation energy density")
+        dset.attrs["radiationProduct"] = np.bytes_(
+            "angular_spectral_energy_density")
+        dset.attrs["observerFrame"] = np.bytes_("laboratory")
+        dset.attrs["observerFrameGamma"] = radiator.gamma_boost
+        dset.attrs["observerFrameBeta"] = radiator.beta_boost
+        dset.attrs["angularMeasure"] = np.bytes_("projected_angles")
+        dset.attrs["angularDensityMeasure"] = np.bytes_(
+            "per_projected_angle_measure_dtheta_x_dtheta_y")
+        dset.attrs["angularCoordinateConvention"] = np.bytes_(
+            "theta_x=atan2(n_x,n_z);theta_y=atan2(n_y,n_z)")
+        dset.attrs["photonEnergyDefinition"] = np.bytes_(
+            "E_photon=hbar*omega_observer")
+        dset.attrs["gammaThreshold"] = radiator.gamma_cutoff
+        dset.attrs["gammaThresholdFrame"] = np.bytes_("laboratory")
+        dset.attrs["accelerationSource"] = np.bytes_(
+            "Lorentz_force_from_gathered_EB_fields")
+        dset.attrs["picEventTimeStaggering"] = np.bytes_(
+            "integer_time_gathered_fields_with_half_step_momentum")
+        dset.attrs["spectralModel"] = np.bytes_(
+            "normalized_classical_synchrotron_curvature")
+        dset.attrs["localAngularModel"] = np.bytes_(
+            "stochastic_gaussian_ultrarelativistic_cone")
+        dset.attrs["macroparticleClosure"] = np.bytes_(
+            "incoherent_linear_in_weight")
+        dset.attrs["accumulationMode"] = np.bytes_("cumulative")
+        dset.attrs["cumulative"] = np.uint32(1)
+        dset.attrs["radiationReaction"] = np.uint32(
+            radiator.radiation_reaction)
 
         # Generic setup of the component
         self.setup_openpmd_component( dset )
