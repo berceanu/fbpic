@@ -38,18 +38,16 @@ class ParticleTracker(object):
             The total number of particles to which id should be attributed
         """
         # Prepare how to attribute new ids
-        self.next_attributed_id = comm_rank
-        self.id_step = comm_size
+        self.next_attributed_id = int(comm_rank)
+        self.id_step = int(comm_size)
+        if self.id_step < 1:
+            raise ValueError("The particle-ID stride must be positive.")
         # Everytime a new id is attributed, next_attributed_id is incremented
         # by id_step ; this way, all the particles (even across different
         # MPI proc) have unique id.
 
         # Initialize the array of ids
-        new_next_attributed_id = self.next_attributed_id + N*self.id_step
-        self.id = np.arange(
-            start=self.next_attributed_id, stop=new_next_attributed_id,
-            step=self.id_step, dtype=np.uint64 )
-        self.next_attributed_id = new_next_attributed_id
+        self.id = self.generate_new_ids( N )
 
     def send_to_gpu(self):
         """
@@ -73,10 +71,18 @@ class ParticleTracker(object):
         N: int
             The number of ids to generate
         """
+        N = int(N)
+        if N < 0:
+            raise ValueError("The number of particle IDs cannot be negative.")
+        if N == 0:
+            return np.empty(0, dtype=np.uint64)
+        last_id = self.next_attributed_id + (N - 1)*self.id_step
+        if last_id > np.iinfo(np.uint64).max:
+            raise OverflowError("The uint64 particle-ID namespace is exhausted.")
+        new_ids = (
+            np.uint64(self.next_attributed_id)
+            + np.arange(N, dtype=np.uint64) * np.uint64(self.id_step))
         new_next_attributed_id = self.next_attributed_id + N*self.id_step
-        new_ids = np.arange(
-            start=self.next_attributed_id, stop=new_next_attributed_id,
-            step=self.id_step, dtype=np.uint64 )
         self.next_attributed_id = new_next_attributed_id
         return( new_ids )
 
@@ -91,6 +97,13 @@ class ParticleTracker(object):
             The indices between which new id should be generated
         """
         N = i_end - i_start
+        if N < 0:
+            raise ValueError("The particle-ID slice cannot have negative size.")
+        if N == 0:
+            return
+        last_id = self.next_attributed_id + (N - 1)*self.id_step
+        if last_id > np.iinfo(np.uint64).max:
+            raise OverflowError("The uint64 particle-ID namespace is exhausted.")
         grid_1d, block_1d = cuda_tpb_bpg_1d( N )
         # Modify the array self.id in-place,
         # between the indices i_start and i_end
@@ -112,24 +125,47 @@ class ParticleTracker(object):
             This is used in order to communicate global information on the
             ids across all MPI ranks
         """
-        # Get the new ids
-        self.id[:] = pid
+        pid = np.asarray(pid)
+        if pid.ndim != 1:
+            raise ValueError("Restored particle IDs must be one-dimensional.")
+        if not np.issubdtype(pid.dtype, np.integer):
+            raise TypeError("Restored particle IDs must have integer dtype.")
+        if np.issubdtype(pid.dtype, np.signedinteger) and np.any(pid < 0):
+            raise ValueError("Restored particle IDs cannot be negative.")
+        if pid.size and np.any(
+                pid.astype(object) > np.iinfo(np.uint64).max):
+            raise OverflowError("A restored particle ID exceeds uint64.")
+
+        # Restart can resize a species, so replace rather than slice-assign.
+        self.id = np.asarray(pid, dtype=np.uint64).copy()
 
         # Set self.next_attributed_id, so that attributed ids are still unique
         # In order to do this, find the maximum of all pid across processors
         if len(pid) > 0:
-            local_id_max = pid.max()
+            local_id_max = int(np.max(pid))
         else:
-            local_id_max = 0
+            local_id_max = -1
         if comm.mpi_comm is None:
             global_id_max = local_id_max
         else:
             local_id_max_list = comm.mpi_comm.allgather( local_id_max )
             global_id_max = max( local_id_max_list )
-        # Find the next_attibuted_id: has to be of the form
+        if (hasattr(comm, 'size')
+                and int(comm.size) != self.id_step):
+            raise RuntimeError(
+                "The restored particle-ID stride does not match the MPI "
+                "communicator size.")
+        # Find the next_attributed_id: it has to be of the form
         # comm.rank + n*self.id_step
-        n = int( (global_id_max - comm.rank)/self.id_step ) + 1
-        self.next_attibuted_id = comm.rank + n*self.id_step
+        rank = int(comm.rank)
+        if global_id_max < rank:
+            next_attributed_id = rank
+        else:
+            n = (global_id_max - rank)//self.id_step + 1
+            next_attributed_id = rank + n*self.id_step
+        # Keeping one-past-uint64 as a Python integer is intentional: a later
+        # allocation then fails explicitly instead of wrapping and colliding.
+        self.next_attributed_id = int(next_attributed_id)
 
 if cuda_installed:
 

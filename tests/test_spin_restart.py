@@ -60,6 +60,9 @@ def run_sim(script_name, n_MPI=1):
 
     checkpoint_dir = './checkpoints'
 
+    script = replace_string(
+        script, r'restart_from_checkpoint\( sim \)',
+        'restart_from_checkpoint( sim, iteration=200 )')
     script = replace_string( script, 'track_electrons = False',
                                 'track_electrons = True')
     # Modify the script to perform N_step, enforce the random seed

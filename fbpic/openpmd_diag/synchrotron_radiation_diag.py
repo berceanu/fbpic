@@ -3,12 +3,21 @@
 # License: 3-Clause-BSD-LBNL
 """Public configuration for observer-frame synchrotron products."""
 
+import os
+import uuid
+
 import numpy as np
+from scipy.constants import c
 
 from fbpic.particles.tracking import ParticleTracker
 from fbpic.utils.mpi import comm as comm_world
 from .generic_diag import OpenPMDDiagnostic
 from .observer_radiation_diag import ObserverRadiationWriter
+from .radiation_segments import (
+    code_revision, diagnostic_configuration, radiation_segment_status,
+    write_segment,
+)
+from .segment_checkpoint import atomic_write_json
 
 def _stable_random_namespace(name):
     """Return a reproducible uint64 namespace for one output species."""
@@ -111,6 +120,9 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         Maximum aggregate peak diagnostic footprint across all configured
         species, including persistent products, bounded workspaces, lookup
         tables, writer/reduction copies, identity state, and pusher coupling.
+    restart_policy : {'require_segment', 'new_segment'}
+        Require a compatible committed predecessor on restart, or explicitly
+        begin a discontinuous new radiation lineage from a legacy checkpoint.
     """
 
     def __init__(
@@ -128,7 +140,8 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             gamma_cutoff=None, energy_band_mode="joint", random_seed=0,
             particle_sampling_fraction=1.0,
             resolution_warning_thresholds=None,
-            max_allocation_bytes=1073741824):
+            max_allocation_bytes=1073741824,
+            restart_policy="require_segment"):
         if not species:
             raise ValueError(
                 "`SynchrotronRadiationDiagnostic` requires at least one "
@@ -139,6 +152,11 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         if observer_frame not in ("laboratory", "lab", "simulation"):
             raise ValueError(
                 "`observer_frame` must be 'laboratory' or 'simulation'.")
+        if restart_policy not in ("require_segment", "new_segment"):
+            raise ValueError(
+                "`restart_policy` must be 'require_segment' or "
+                "'new_segment'.")
+        self.restart_policy = restart_policy
         if max_allocation_bytes is not None:
             try:
                 max_allocation_bytes = int(max_allocation_bytes)
@@ -337,22 +355,515 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             dt_period=dt_period, dt_sim=self.dt_sim,
         )
         self.observer_writer = ObserverRadiationWriter(self, output_mode)
+        self.diagnostic_id = "observer_radiation:%s" % ",".join(
+            sorted(self.species_names))
+        (self.segment_configuration,
+         self.configuration_fingerprint) = diagnostic_configuration(self)
+        self.code_revision = code_revision()
+        self.segment_dir = os.path.join(self.write_dir, "segments")
+        self.segment_manifest_dir = os.path.join(
+            self.segment_dir, "manifests")
+        self.create_dir("segments")
+        self.create_dir(os.path.join("segments", "manifests"))
+
+        # Segment identity is supplied by Simulation on first use. Keeping
+        # these fields small and separate from the accumulator is what makes
+        # checkpoint metadata independent of radiation array layout.
+        self._segment_initialized = False
+        self._segment_finalized = False
+        self._segment_state = "uninitialized"
+        self._segment_id = None
+        self._segment_run_id = None
+        self._segment_event_begin = None
+        self._segment_parent_checkpoint_id = None
+        self._segment_parent_checkpoint_iteration = None
+        self._segment_continuity = None
+        self._closed_segment_reference = None
+        self._last_segment_reference = None
         # Leave established diagnostics at their pre-push phase; the PIC loop
         # schedules this diagnostic only after a completed pusher impulse.
         self.write_after_momentum_push = True
 
     def write_hdf5(self, iteration):
         """Write a scheduled snapshot only when a new event is available."""
+        if self._segment_finalized:
+            raise RuntimeError(
+                "Observer radiation was finalized; start a new run before "
+                "writing more scheduled snapshots.")
+        if not self._segment_initialized:
+            self._initialize_standalone_segment()
         return self.observer_writer.write(iteration, final_flush=False)
 
-    def finalize(self):
-        """Explicitly write the latest unwritten completed pusher event.
+    def _collective_segment_id(self):
+        """Return one UUID shared by all ranks participating in the write."""
+        value = uuid.uuid4().hex if self.rank == 0 else None
+        size = 1 if self.comm is None else int(self.comm.size)
+        if size > 1:
+            value = comm_world.bcast(value, root=0)
+        return value
 
-        This operation is independent of the scheduled cadence and iteration
-        window. It is idempotent: it returns ``False`` without writing when
-        all completed events are already represented by an output file.
+    def _find_checkpoint_segment(self, context):
+        matches = [
+            item for item in context.get("segments", [])
+            if item.get("diagnosticId") == self.diagnostic_id]
+        if len(matches) > 1:
+            raise RuntimeError(
+                "The checkpoint contains duplicate radiation segment "
+                "references for `%s`." % self.diagnostic_id)
+        return matches[0] if matches else None
+
+    def _receive_accumulators(self):
+        initially_on_gpu = {}
+        for species_name, accumulator in self.accumulators.items():
+            initially_on_gpu[species_name] = bool(accumulator._on_gpu)
+            if initially_on_gpu[species_name]:
+                self.species[species_name].synchrotron_radiator.receive_from_gpu()
+        return initially_on_gpu
+
+    def _restore_accumulators(self, initially_on_gpu):
+        for species_name, was_on_gpu in initially_on_gpu.items():
+            if was_on_gpu:
+                self.species[species_name].synchrotron_radiator.send_to_gpu()
+
+    def _reset_segment_accumulators(self):
+        initially_on_gpu = self._receive_accumulators()
+        try:
+            for accumulator in self.accumulators.values():
+                accumulator.reset_segment_state()
+            self.observer_writer.previous = {}
+            self.observer_writer.pending_previous = {}
+            self.observer_writer.active_timing = {}
+            self.observer_writer.last_written_events = {
+                name: int(self.accumulators[name].completed_event_count)
+                for name in self.species_names}
+        finally:
+            self._restore_accumulators(initially_on_gpu)
+
+    def _open_segment(self, run_id, event_begin, parent_id,
+                      parent_iteration, continuity):
+        self._segment_run_id = str(run_id)
+        self._segment_id = self._collective_segment_id()
+        self._segment_event_begin = int(event_begin)
+        for accumulator in self.accumulators.values():
+            if (accumulator.last_completed_event_index is None
+                    and self._segment_event_begin > 0):
+                accumulator.last_completed_event_index = (
+                    self._segment_event_begin - 1)
+        self._segment_parent_checkpoint_id = parent_id
+        self._segment_parent_checkpoint_iteration = (
+            None if parent_iteration is None else int(parent_iteration))
+        self._segment_continuity = continuity
+        self._segment_initialized = True
+        self._segment_state = "open"
+        self._closed_segment_reference = None
+
+    def _restart_problems(self, context, reference):
+        problems = []
+        if reference is None:
+            problems.append("no predecessor segment is recorded")
+        else:
+            if reference.get("configurationFingerprint") != (
+                    self.configuration_fingerprint):
+                problems.append("the diagnostic fingerprint changed")
+            if reference.get("closingCheckpointId") != (
+                    context.get("checkpoint_id")):
+                problems.append("the segment closes at a different checkpoint")
+            if int(reference.get("eventEndExclusive", -1)) != int(
+                    context.get("iteration", -2)):
+                problems.append("the event boundary differs from the checkpoint")
+            if radiation_segment_status(reference.get("path", "")) != (
+                    "committed"):
+                problems.append("the predecessor segment is not committed")
+        missing_ids = [
+            name for name, particle_species in self.species.items()
+            if not bool(getattr(
+                particle_species, "_persistent_ids_restored", False))]
+        if missing_ids:
+            problems.append(
+                "persistent particle IDs were not restored for %s"
+                % ", ".join(sorted(missing_ids)))
+        return problems
+
+    def start_segment(self, context):
+        """Start a zeroed segment at genesis, restart, or a committed boundary."""
+        context = dict(context)
+        if self._segment_finalized:
+            raise RuntimeError(
+                "This radiation diagnostic was finalized and cannot be resumed.")
+
+        if context.get("initial", False):
+            if self._segment_initialized:
+                return False
+            event_begin = int(context.get("iteration", 0))
+            run_id = context.get("run_id") or self._collective_segment_id()
+            continuity = "genesis"
+            if context.get("restart", False):
+                reference = self._find_checkpoint_segment(context)
+                problems = self._restart_problems(context, reference)
+                if problems and self.restart_policy != "new_segment":
+                    detail = "; ".join(problems)
+                    raise RuntimeError(
+                        "Cannot continue observer radiation seamlessly: %s. "
+                        "For a legacy or intentionally discontinuous restart, "
+                        "construct the diagnostic with "
+                        "restart_policy='new_segment'." % detail)
+                if problems:
+                    run_id = self._collective_segment_id()
+                    continuity = (
+                        "discontinuous_legacy_restart"
+                        if context.get("legacy", False) else
+                        "discontinuous_restart")
+                else:
+                    run_id = reference["runId"]
+                    continuity = "seamless"
+            if any(
+                    accumulator.completed_event_count != 0
+                    for accumulator in self.accumulators.values()):
+                raise RuntimeError(
+                    "A Simulation-managed radiation segment must start from "
+                    "a zeroed accumulator.")
+            self._open_segment(
+                run_id, event_begin, context.get("checkpoint_id"),
+                context.get("checkpoint_iteration"), continuity)
+            return True
+
+        if not self._segment_initialized or self._segment_state != "closed":
+            raise RuntimeError(
+                "A new radiation segment can start only after its predecessor "
+                "has closed.")
+        reference = self._find_checkpoint_segment(context)
+        if reference is None or reference.get("segmentId") != self._segment_id:
+            raise RuntimeError(
+                "The committed checkpoint does not reference the segment that "
+                "was just closed.")
+        if radiation_segment_status(reference["path"]) != "committed":
+            self._segment_state = "orphaned"
+            raise RuntimeError(
+                "The closed radiation segment was not committed by its "
+                "checkpoint manifest.")
+        if reference.get("configurationFingerprint") != (
+                self.configuration_fingerprint):
+            raise RuntimeError(
+                "The committed segment fingerprint changed in memory.")
+        if int(context["iteration"]) != int(
+                reference["eventEndExclusive"]):
+            raise RuntimeError(
+                "The next radiation segment does not begin at the committed "
+                "predecessor boundary.")
+        self._last_segment_reference = dict(reference)
+        self._reset_segment_accumulators()
+        self._open_segment(
+            reference["runId"], int(context["iteration"]),
+            context.get("checkpoint_id"),
+            context.get("checkpoint_iteration"), "seamless")
+        return True
+
+    def prepare_step(self, iteration):
+        """Ensure stepping always targets a writable, unambiguous segment."""
+        if self._segment_finalized:
+            # Historically a diagnostic could be finalized and then reused.
+            # Preserve that convenience without reopening a committed run:
+            # resumed events form a new independently mergeable run.
+            self._reset_segment_accumulators()
+            self._segment_finalized = False
+            self._open_segment(
+                self._collective_segment_id(), int(iteration),
+                None, None, "genesis_after_finalize")
+        if self._segment_state in ("closed", "orphaned"):
+            raise RuntimeError(
+                "Observer radiation has no writable open segment.")
+        if (self._segment_initialized
+                and int(iteration) < self._segment_event_begin):
+            raise RuntimeError(
+                "Simulation iteration precedes the open radiation segment.")
+
+    def _validate_segment_range(self, event_end_exclusive):
+        begin = int(self._segment_event_begin)
+        end = int(event_end_exclusive)
+        if end < begin:
+            raise RuntimeError("Radiation segment event range is reversed.")
+        expected = end - begin
+        for species_name, accumulator in self.accumulators.items():
+            timing = accumulator.cumulative_timing
+            count = int(timing["event_count"])
+            if count != expected:
+                raise RuntimeError(
+                    "Radiation segment [%d, %d) for `%s` contains %d of %d "
+                    "required pusher events. Refusing to commit a gap."
+                    % (begin, end, species_name, count, expected))
+            if expected == 0:
+                continue
+            first = int(timing["first_event_index"])
+            timed_last = int(timing["last_event_index"])
+            last = accumulator.last_completed_event_index
+            if (first != begin or timed_last != end - 1
+                    or last is None or int(last) != timed_last):
+                raise RuntimeError(
+                    "Radiation timing for `%s` does not exactly represent "
+                    "the half-open event range [%d, %d)."
+                    % (species_name, begin, end))
+        return begin, end
+
+    def _reduced_segment_states(self):
+        initially_on_gpu = self._receive_accumulators()
+        try:
+            return {
+                species_name: self.observer_writer._reduce_snapshot(
+                    accumulator.snapshot())
+                for species_name, accumulator in self.accumulators.items()}
+        finally:
+            self._restore_accumulators(initially_on_gpu)
+
+    @staticmethod
+    def _timing_metadata(timing):
+        count = int(timing["event_count"])
+        if count == 0:
+            return {
+                "completedEventCount": 0,
+                "firstCompletedEventIndex": None,
+                "lastCompletedEventIndex": None,
+                "firstEventCenterSimulation": None,
+                "lastEventCenterSimulation": None,
+                "representedIntervalStartSimulation": None,
+                "representedIntervalEndSimulation": None,
+            }
+        return {
+            "completedEventCount": count,
+            "firstCompletedEventIndex": int(timing["first_event_index"]),
+            "lastCompletedEventIndex": int(timing["last_event_index"]),
+            "firstEventCenterSimulation": float(
+                timing["first_event_center"]),
+            "lastEventCenterSimulation": float(timing["last_event_center"]),
+            "representedIntervalStartSimulation": float(
+                timing["represented_interval_start"]),
+            "representedIntervalEndSimulation": float(
+                timing["represented_interval_end"]),
+        }
+
+    def _segment_metadata(self, context, begin, end, states):
+        frame_times = {}
+        actual_timing = {}
+        random_namespaces = {}
+        has_events = end > begin
+        for species_name in sorted(self.species_names):
+            accumulator = self.accumulators[species_name]
+            translation_time = accumulator.observer_translation[0] / c
+            timing = states[species_name]["timing"]
+            if has_events:
+                first_center = float(timing["first_event_center"])
+                last_center = float(timing["last_event_center"])
+                interval_start = float(timing["represented_interval_start"])
+                interval_end = float(timing["represented_interval_end"])
+            else:
+                first_center = None
+                last_center = None
+                interval_start = begin * self.dt_sim
+                interval_end = interval_start
+            frame_times[species_name] = {
+                "simulationEventCenterStart": first_center,
+                "simulationEventCenterEnd": last_center,
+                "simulationImpulseIntervalStart": interval_start,
+                "simulationImpulseIntervalEnd": interval_end,
+                "observerOriginEventCenterStart": (
+                    None if first_center is None else
+                    accumulator.gamma_boost * first_center + translation_time),
+                "observerOriginEventCenterEnd": (
+                    None if last_center is None else
+                    accumulator.gamma_boost * last_center + translation_time),
+                "observerOriginImpulseIntervalStart": (
+                    accumulator.gamma_boost * interval_start
+                    + translation_time),
+                "observerOriginImpulseIntervalEnd": (
+                    accumulator.gamma_boost * interval_end
+                    + translation_time),
+            }
+            actual_timing[species_name] = self._timing_metadata(
+                states[species_name]["timing"])
+            random_namespaces[species_name] = {
+                "seed": int(accumulator.random_seed),
+                "speciesNamespace": int(accumulator.random_namespace),
+                "streamIdentifiers": dict(accumulator.random_stream_ids),
+                "eventKey": (
+                    "absolute_simulation_event_index;"
+                    "persistent_particle_id;species_namespace;seed;stream;"
+                    "sample_index"),
+            }
+        return {
+            "artifactType": "radiation_segment",
+            "radiationStateSchemaVersion": self.segment_configuration[
+                "radiationStateSchemaVersion"],
+            "runId": self._segment_run_id,
+            "segmentId": self._segment_id,
+            "diagnosticId": self.diagnostic_id,
+            "parentCheckpointId": self._segment_parent_checkpoint_id,
+            "parentCheckpointIteration":
+                self._segment_parent_checkpoint_iteration,
+            "closingCheckpointId": context.get("checkpoint_id"),
+            "closingCheckpointIteration": context.get(
+                "checkpoint_iteration"),
+            "eventConvention": "half_open_[eventBegin,eventEndExclusive)",
+            "eventBegin": begin,
+            "eventEndExclusive": end,
+            "firstRadiationEventIndex": begin if has_events else None,
+            "lastRadiationEventIndex": end - 1 if has_events else None,
+            "frameTimes": frame_times,
+            "completedEventTiming": actual_timing,
+            "segmentStatus": "closed",
+            "closeReason": context["close_reason"],
+            "accumulationScope": "segment",
+            "continuity": self._segment_continuity,
+            "configurationFingerprint": self.configuration_fingerprint,
+            "randomness": random_namespaces,
+            "persistentParticleIdentity": "fbpic_particle_tracker_uint64",
+            "commitManifest": os.path.abspath(context["commit_manifest"]),
+            "codeRevision": self.code_revision,
+        }
+
+    def close_segment(self, context):
+        """Persist raw mergeable state for one half-open event interval."""
+        context = dict(context)
+        if not self._segment_initialized:
+            raise RuntimeError("No radiation segment is open.")
+        if self._segment_state == "closed":
+            reference = self._closed_segment_reference
+            if (reference is not None
+                    and reference.get("closingCheckpointId")
+                    == context.get("checkpoint_id")):
+                return dict(reference)
+            raise RuntimeError("Radiation segment is already closed.")
+        if self._segment_state != "open":
+            raise RuntimeError(
+                "Radiation segment cannot close from state `%s`."
+                % self._segment_state)
+
+        begin, end = self._validate_segment_range(
+            context["event_end_exclusive"])
+        states = self._reduced_segment_states()
+        path = os.path.abspath(os.path.join(
+            self.segment_dir, "segment-%s.h5" % self._segment_id))
+        if self.rank == 0:
+            metadata = self._segment_metadata(
+                context, begin, end, states)
+            write_segment(
+                path, metadata, self.segment_configuration,
+                self.configuration_fingerprint, states)
+        reference = {
+            "runId": self._segment_run_id,
+            "segmentId": self._segment_id,
+            "diagnosticId": self.diagnostic_id,
+            "path": path,
+            "parentCheckpointId": self._segment_parent_checkpoint_id,
+            "closingCheckpointId": context.get("checkpoint_id"),
+            "parentCheckpointIteration":
+                self._segment_parent_checkpoint_iteration,
+            "closingCheckpointIteration": context.get(
+                "checkpoint_iteration"),
+            "eventBegin": begin,
+            "eventEndExclusive": end,
+            "configurationFingerprint": self.configuration_fingerprint,
+            "closeReason": context["close_reason"],
+        }
+        self._segment_state = "closed"
+        self._closed_segment_reference = dict(reference)
+        return reference
+
+    def _initialize_standalone_segment(self):
+        first_indices = [
+            int(accumulator.cumulative_timing["first_event_index"])
+            for accumulator in self.accumulators.values()
+            if int(accumulator.cumulative_timing["event_count"]) > 0]
+        event_begin = min(first_indices) if first_indices else 0
+        self._open_segment(
+            self._collective_segment_id(), event_begin, None, None, "genesis")
+
+    def finalize_segment(self):
+        """Close and commit the final segment without a simulation checkpoint."""
+        if self._segment_finalized:
+            return False
+        if not self._segment_initialized:
+            self._initialize_standalone_segment()
+        if self._segment_state != "open":
+            raise RuntimeError(
+                "Only an open radiation segment can be finalized.")
+        last_indices = [
+            int(accumulator.last_completed_event_index)
+            for accumulator in self.accumulators.values()
+            if accumulator.last_completed_event_index is not None]
+        event_end = (
+            max(last_indices) + 1 if last_indices
+            else int(self._segment_event_begin))
+        manifest_path = os.path.abspath(os.path.join(
+            self.segment_manifest_dir,
+            "final-%s.json" % self._segment_id))
+        context = {
+            "checkpoint_id": None,
+            "checkpoint_iteration": None,
+            "event_end_exclusive": event_end,
+            "close_reason": "finalize",
+            "commit_manifest": manifest_path,
+        }
+        reference = self.close_segment(context)
+        manifest = {
+            "radiationSegmentManifestSchemaVersion": 1,
+            "manifestType": "radiation_finalization",
+            "segmentStatus": "committed",
+            "runId": self._segment_run_id,
+            "diagnosticId": self.diagnostic_id,
+            "configurationFingerprint": self.configuration_fingerprint,
+            "eventEndExclusive": event_end,
+            "segments": [reference],
+        }
+        if self.rank == 0:
+            atomic_write_json(manifest_path, manifest)
+        if (1 if self.comm is None else int(self.comm.size)) > 1:
+            comm_world.barrier()
+        if radiation_segment_status(reference["path"]) != "committed":
+            self._segment_state = "orphaned"
+            raise RuntimeError(
+                "Final radiation segment did not acquire a commit manifest.")
+        self._segment_state = "committed"
+        self._segment_finalized = True
+        self._last_segment_reference = dict(reference)
+        return True
+
+    @property
+    def segment_status(self):
+        """Return the derived state of the current persisted segment."""
+        if self._segment_state == "uninitialized":
+            return "open"
+        if self._segment_state == "closed":
+            persisted = radiation_segment_status(
+                self._closed_segment_reference["path"])
+            return "committed" if persisted == "committed" else "closed"
+        return self._segment_state
+
+    def get_segment_status(self):
+        """Return current and most recently closed segment identities."""
+        last_status = None
+        if self._last_segment_reference is not None:
+            last_status = radiation_segment_status(
+                self._last_segment_reference["path"])
+        return {
+            "current": self.segment_status,
+            "runId": self._segment_run_id,
+            "segmentId": self._segment_id,
+            "eventBegin": self._segment_event_begin,
+            "lastClosed": self._last_segment_reference,
+            "lastClosedStatus": last_status,
+        }
+
+    def finalize(self):
+        """Flush the latest snapshot and commit the terminal segment.
+
+        Finalization is terminal for this diagnostic and is idempotent. Normal
+        :meth:`Simulation.step` calls never invoke it implicitly.
         """
-        return self.observer_writer.write(None, final_flush=True)
+        if not self._segment_initialized:
+            self._initialize_standalone_segment()
+        snapshot_written = self.observer_writer.write(
+            None, final_flush=True)
+        segment_committed = self.finalize_segment()
+        return bool(snapshot_written or segment_committed)
 
     def flush(self, iteration=None):
         """Compatibility alias for :meth:`finalize`.

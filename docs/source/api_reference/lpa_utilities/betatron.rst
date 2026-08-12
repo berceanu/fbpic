@@ -314,12 +314,68 @@ must use those edges instead of the fallback unit mesh spacing. File iteration
 and time always refer to the latest completed pusher event included in that
 file, not the latest detector arrival time.
 
-Scheduled writes obey period, iteration_min, and iteration_max. Returning from
-Simulation.step does not flush radiation or reset interval accumulators. At a
-true run ending, call simulation.finalize_diagnostics() (or
-radiation.finalize()) to write a dirty final event once. Finalization is
-idempotent and intentionally independent of the scheduled cadence/window, so
-it can also serve as an explicitly requested off-cadence flush.
+Scheduled writes obey period, iteration_min, and iteration_max. They are
+``radiation_scheduled_snapshot`` artifacts whose accumulation scope is the
+currently open segment. Returning from ``Simulation.step`` neither closes a
+segment nor forces an off-cadence write.
+
+Checkpointed runs use half-open absolute event ranges. A checkpoint at
+simulation iteration :math:`k` closes a canonical segment
+``[eventBegin, k)``; therefore the completed event :math:`k-1` is included
+once, while event :math:`k` is the first event a restart executes. The reduced
+radiation state is written to ``<write_dir>/segments/segment-<id>.h5``. It
+contains additive arrays and counters, centered source-moment sufficient
+statistics, and retained interval histograms. The normal FBPIC checkpoint does
+not contain these arrays. A small checkpoint manifest is published only after
+both the simulation payload and every diagnostic segment have closed, making
+an unreferenced or partially written segment orphaned and unacceptable by
+default.
+
+A restart reconstructs the diagnostic from its input configuration, verifies
+its deterministic compatibility fingerprint and restored persistent particle
+IDs, and opens a zeroed segment at the checkpoint iteration. The random event
+key continues to use the absolute simulation iteration. An old checkpoint
+without segment metadata is deliberately not treated as seamless; beginning a
+new, discontinuous radiation lineage requires an explicit policy:
+
+.. code-block:: python
+
+    radiation = SynchrotronRadiationDiagnostic(
+        ...,
+        restart_policy="new_segment",
+    )
+
+
+At a true run ending, call ``simulation.finalize_diagnostics()`` (or
+``radiation.finalize()``). This performs any dirty off-cadence snapshot and
+commits the terminal segment with close reason ``finalize``. It is idempotent.
+Continuing to step after finalization preserves the historical API but begins
+a new zeroed radiation run with a new run identifier; it cannot silently
+extend the already committed result.
+
+Whole-run radiation is an offline product. Pass the committed segment files
+for one selected checkpoint lineage to the strict merger (input order is not
+significant):
+
+.. code-block:: python
+
+    from fbpic.openpmd_diag import merge_radiation_segments
+
+    merge_radiation_segments(
+        ["segment-a.h5", "segment-b.h5"],
+        "radiation-whole-run.h5",
+    )
+
+The merger rejects uncommitted files, duplicate IDs, gaps, overlaps, broken
+checkpoint ancestry, and incompatible fingerprints. It never silently rebins.
+Additive state is summed, centered moment statistics are combined with the
+parallel covariance formula, and source and observer-time quantiles are
+reconstructed from the merged histograms. Only a selection that begins at a
+lineage origin and ends in an explicit final segment is labeled
+``radiation_merged_whole_run``; other valid selections are clearly labeled as
+lineage selections. ``radiation_segment_status(path)`` reports whether a
+persisted segment is committed or orphaned, while
+``radiation.get_segment_status()`` also exposes the live open/closed state.
 
 Packet work scales with samples_per_particle rather than photon-energy-bin
 count. Each stateless random variate is keyed by diagnostic seed, persistent
@@ -344,3 +400,7 @@ API reference
 .. automethod:: fbpic.particles.Particles.activate_synchrotron
 
 .. autoclass:: fbpic.openpmd_diag.SynchrotronRadiationDiagnostic
+
+.. autofunction:: fbpic.openpmd_diag.merge_radiation_segments
+
+.. autofunction:: fbpic.openpmd_diag.radiation_segment_status

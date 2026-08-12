@@ -9,72 +9,70 @@ as well as reload a simulation from a set of checkpoints.
 """
 import os
 import re
+import h5py
 import numpy as np
 from scipy.constants import e
 from .field_diag import FieldDiagnostic
 from .particle_diag import ParticleDiagnostic
 from fbpic.utils.mpi import comm
+from .segment_checkpoint import (
+    CheckpointSet, active_manifest_path, atomic_write_json,
+    collective_uuid, selected_checkpoint_manifest,
+)
+from fbpic.particles.tracking import ParticleTracker
 
 # Check if CUDA is available, then import CUDA
 from fbpic.utils.cuda import cuda_installed
 if cuda_installed:
     import cupy
 
-
 def set_periodic_checkpoint( sim, period, checkpoint_dir='./checkpoints' ):
-    """
-    Set up periodic checkpoints of the simulation
+    """Register periodic, committed simulation checkpoints.
 
-    The checkpoints are saved in openPMD format, in the specified
-    directory, with one subdirectory per process.
-    The E and B fields and particle information of each processor is saved.
-
-    NB: Checkpoints are registered in the list `checkpoints` of the Simulation
-    object `sim`, and written at the end of the PIC loop (whereas regular
-    diagnostics are written at the beginning of the PIC loop).
+    Field and particle payloads retain their established openPMD layout. A
+    small manifest is published only after all payloads and diagnostic
+    segments close successfully.
 
     Parameters
     ----------
-    sim: a Simulation object
-       The simulation that is to be saved in checkpoints
+    sim : Simulation
+        Simulation whose fields, particles, and segment hooks are committed.
+    period : int
+        Positive checkpoint cadence in completed simulation iterations.
+    checkpoint_dir : str, optional
+        Shared checkpoint directory. Per-rank payloads remain under ``procN``.
 
-    period: integer
-       The number of PIC iteration between each checkpoint.
-
-    checkpoint_dir: string, optional
-        The path to the directory in which the checkpoints are stored
-        (When running a simulation with several MPI ranks, use the
-        same path for all ranks.)
+    Returns
+    -------
+    CheckpointSet
+        The registered aggregate checkpoint writer.
     """
-    # Only processor 0 creates a directory where checkpoints will be stored
-    # Make sure that all processors wait until this directory is created
-    # (Use the global MPI communicator instead of the `BoundaryCommunicator`
-    # so that this still works in the case `use_all_ranks=False`)
-    if comm.rank == 0:
-        if os.path.exists(checkpoint_dir) is False:
-            os.mkdir(checkpoint_dir)
+    if comm.rank == 0 and not os.path.isdir(checkpoint_dir):
+        os.makedirs(checkpoint_dir)
     comm.barrier()
 
-    # Choose the name of the directory: one directory per processor
-    write_dir = os.path.join(checkpoint_dir, 'proc%d/' %comm.rank)
+    write_dir = os.path.join(checkpoint_dir, 'proc%d/' % comm.rank)
+    components = []
 
-    # Register a periodic FieldDiagnostic in the diagnostics of the simulation
-    # This saves only the E and B field (and their PML components, if used)
     fieldtypes = ["E", "B"]
     if sim.use_pml:
         fieldtypes += ["Er_pml", "Et_pml", "Br_pml", "Bt_pml"]
-    sim.checkpoints.append( FieldDiagnostic( period, sim.fld,
-                        fieldtypes=fieldtypes, write_dir=write_dir ) )
+    components.append(FieldDiagnostic(
+        period, sim.fld, fieldtypes=fieldtypes, write_dir=write_dir))
 
-    # Register a periodic ParticleDiagnostic, which contains all
-    # the particles which are present in the simulation
-    particle_dict = {}
-    for i in range(len(sim.ptcl)):
-        particle_dict[ 'species %d' %i ] = sim.ptcl[i]
+    particle_dict = {
+        'species %d' % index: species
+        for index, species in enumerate(sim.ptcl)}
+    if particle_dict:
+        components.append(ParticleDiagnostic(
+            period, particle_dict, write_dir=write_dir))
 
-    if len(particle_dict)>0:
-        sim.checkpoints.append(
-            ParticleDiagnostic( period, particle_dict, write_dir=write_dir ) )
+    checkpoint = CheckpointSet(
+        sim, period, checkpoint_dir, components)
+    sim.checkpoints.append(checkpoint)
+    return checkpoint
+
+
 
 
 def restart_from_checkpoint( sim, iteration=None,
@@ -131,6 +129,10 @@ def restart_from_checkpoint( sim, iteration=None,
         'The package openPMD-viewer is required to restart from checkpoints.'
         '\nPlease install it from https://github.com/openPMD/openPMD-viewer')
 
+    checkpoint_manifest = selected_checkpoint_manifest(
+        checkpoint_dir, iteration)
+    if iteration is None and checkpoint_manifest is not None:
+        iteration = int(checkpoint_manifest["iteration"])
     # Verify that the restart is valid (only for the first processor)
     # (Use the global MPI communicator instead of the `BoundaryCommunicator`,
     # so that this also works for `use_all_ranks=False`)
@@ -144,9 +146,40 @@ def restart_from_checkpoint( sim, iteration=None,
     ts = OpenPMDTimeSeries( data_dir )
     # Select the iteration, and its index
     if iteration is None:
-        iteration = ts.iterations[-1]
-    # Find the index of the closest iteration
-    i_iteration = np.argmin( abs(np.array(ts.iterations) - iteration) )
+        iteration = int(ts.iterations[-1])
+    iteration = int(iteration)
+    available_iterations = np.asarray(ts.iterations, dtype=np.int64)
+    matching = np.where(available_iterations == iteration)[0]
+    if matching.size != 1:
+        raise RuntimeError(
+            "Checkpoint iteration %d is not available exactly." % iteration)
+    i_iteration = int(matching[0])
+
+    # If no active manifest selected the iteration, now distinguish an old
+    # checkpoint from a new-format checkpoint whose commit is incomplete.
+    if checkpoint_manifest is None:
+        checkpoint_manifest = selected_checkpoint_manifest(
+            checkpoint_dir, iteration)
+    if checkpoint_manifest is not None:
+        if int(checkpoint_manifest["iteration"]) != iteration:
+            raise RuntimeError(
+                "Checkpoint manifest iteration does not match its payload.")
+        payload = os.path.join(
+            checkpoint_dir, "proc%d" % comm.rank, "hdf5",
+            "data%08d.h5" % iteration)
+        with h5py.File(payload, "r") as checkpoint:
+            checkpoint_id = checkpoint.attrs.get("checkpointId", "")
+            checkpoint_run_id = checkpoint.attrs.get("checkpointRunId", "")
+            if isinstance(checkpoint_id, bytes):
+                checkpoint_id = checkpoint_id.decode("utf-8")
+            if isinstance(checkpoint_run_id, bytes):
+                checkpoint_run_id = checkpoint_run_id.decode("utf-8")
+            if (str(checkpoint_id) != checkpoint_manifest["checkpointId"]
+                    or str(checkpoint_run_id)
+                    != checkpoint_manifest["runId"]):
+                raise RuntimeError(
+                    "Checkpoint payload identity does not match its committed "
+                    "manifest.")
 
     # Modify parameters of the simulation
     sim.iteration = iteration
@@ -190,6 +223,38 @@ simulation or sim.ptcl = [] to remove them""".format(len(avail_species),
     # and shift the global domain position in the BoundaryCommunicator
     zmin_new = sim.fld.interp[0].zmin
     sim.comm.shift_global_domain_positions( zmin_new - zmin_old )
+    if checkpoint_manifest is None:
+        restart_context = {
+            "restart": True,
+            "legacy": True,
+            "run_id": collective_uuid(),
+            "checkpoint_id": None,
+            "checkpoint_iteration": int(iteration),
+            "iteration": int(iteration),
+            "segments": [],
+        }
+    else:
+        restart_context = {
+            "restart": True,
+            "legacy": False,
+            "run_id": checkpoint_manifest["runId"],
+            "checkpoint_id": checkpoint_manifest["checkpointId"],
+            "checkpoint_iteration": int(checkpoint_manifest["iteration"]),
+            "iteration": int(checkpoint_manifest["iteration"]),
+            "segments": list(checkpoint_manifest.get("segments", [])),
+            "checkpoint_manifest": checkpoint_manifest,
+        }
+        if comm.rank == 0:
+            atomic_write_json(
+                active_manifest_path(checkpoint_dir), checkpoint_manifest)
+        comm.barrier()
+
+    sim._run_id = restart_context["run_id"]
+    sim._checkpoint_parent_id = restart_context["checkpoint_id"]
+    sim._checkpoint_parent_iteration = int(iteration)
+    sim._checkpoint_restart_context = restart_context
+    sim._checkpoint_dir = os.path.abspath(checkpoint_dir)
+    return restart_context
 
 
 def check_restart( sim, iteration, checkpoint_dir ):
@@ -334,8 +399,18 @@ def load_species( species, name, ts, iteration, comm, openpmd_viewer_version ):
     # Check if the particles where tracked
     if "id" in ts.avail_record_components[name]:
         pid, = ts.get_particle( ['id'], iteration=iteration, species=name )
-        species.track( comm )
+        if species.tracker is None:
+            species.track( comm )
         species.tracker.overwrite_ids( pid, comm )
+        species._persistent_ids_restored = True
+    else:
+        # An active tracker belongs to the pre-restart population. Rebuild it
+        # for the restored particles, but record that these are new identities
+        # so stochastic diagnostics cannot claim a seamless continuation.
+        if species.tracker is not None:
+            species.tracker = ParticleTracker(
+                comm.size, comm.rank, species.Ntot)
+        species._persistent_ids_restored = False
 
     # If the species is ionizable, set the proper arrays
     if species.ionizer is not None:

@@ -683,6 +683,18 @@ class ObserverRadiationWriter(object):
         ])
 
     def _common_attributes(self, record, accumulator, species_name, mode):
+        diagnostic = self.diagnostic
+        record.attrs["artifactType"] = _bytes(
+            "radiation_scheduled_snapshot")
+        record.attrs["accumulationScope"] = _bytes("segment")
+        record.attrs["radiationRunId"] = _bytes(
+            diagnostic._segment_run_id or "")
+        record.attrs["radiationSegmentId"] = _bytes(
+            diagnostic._segment_id or "")
+        record.attrs["radiationSegmentStatusAtWrite"] = _bytes(
+            diagnostic.segment_status)
+        record.attrs["radiationConfigurationFingerprint"] = _bytes(
+            diagnostic.configuration_fingerprint)
         record.attrs["observerFrame"] = _bytes(accumulator.observer_frame)
         record.attrs["observerFrameGamma"] = accumulator.gamma_boost
         record.attrs["observerFrameBeta"] = accumulator.beta_boost
@@ -1419,6 +1431,21 @@ class ObserverRadiationWriter(object):
                     file_handle, file_iteration, observer_time, observer_dt)
                 iteration_group = file_handle[
                     "/data/%d" % file_iteration]
+                for target in (file_handle, iteration_group):
+                    target.attrs["artifactType"] = _bytes(
+                        "radiation_scheduled_snapshot")
+                    target.attrs["accumulationScope"] = _bytes("segment")
+                    target.attrs["radiationRunId"] = _bytes(
+                        diagnostic._segment_run_id or "")
+                    target.attrs["radiationSegmentId"] = _bytes(
+                        diagnostic._segment_id or "")
+                    target.attrs["radiationSegmentStatusAtWrite"] = _bytes(
+                        diagnostic.segment_status)
+                    target.attrs["radiationConfigurationFingerprint"] = _bytes(
+                        diagnostic.configuration_fingerprint)
+                    if diagnostic._segment_event_begin is not None:
+                        target.attrs["radiationSegmentEventBegin"] = np.int64(
+                            diagnostic._segment_event_begin)
                 iteration_group.attrs["timeReferenceFrame"] = _bytes(
                     first.observer_frame)
                 iteration_group.attrs["timeReferenceEvent"] = _bytes(

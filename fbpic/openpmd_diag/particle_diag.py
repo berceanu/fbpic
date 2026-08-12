@@ -227,6 +227,15 @@ class ParticleDiagnostic(OpenPMDDiagnostic) :
             if species.use_cuda :
                 species.receive_particles_from_gpu()
 
+        # Tracking can be enabled after this diagnostic is constructed (for
+        # instance by observer-radiation setup). Check at write time so that a
+        # checkpoint never silently omits persistent IDs because of setup
+        # ordering.
+        for species_name in self.species_names_list:
+            species = self.species_dict[species_name]
+            quantities = self.array_quantities_dict[species_name]
+            if species.tracker is not None and "id" not in quantities:
+                quantities.append("id")
         # Create the file and setup the openPMD structure (only first proc)
         if self.rank == 0:
             filename = "data%08d.h5" %iteration
@@ -242,40 +251,44 @@ class ParticleDiagnostic(OpenPMDDiagnostic) :
 
             # Check if the species exists
             species = self.species_dict[species_name]
-            if species is None :
-                # If not, immediately go to the next species_name
+            if species is None:
                 continue
 
-            # Setup the species group (only first proc)
-            if self.rank==0:
-                species_path = "/data/%d/particles/%s" %(
-                    iteration, species_name)
-                # Create and setup the h5py.Group species_grp
-                species_grp = f.require_group( species_path )
-                self.setup_openpmd_species_group( species_grp, species,
-                                self.constant_quantities_dict[species_name])
-            else:
-                species_grp = None
-
-            # Select the particles that will be written
-            select_array = self.apply_selection( species )
-            # Get their total number
+            # Select particles and determine the shared record extent before
+            # creating constant components. Current openPMD readers require
+            # constant and array records of a species to advertise the same
+            # particle extent.
+            select_array = self.apply_selection(species)
             n = select_array.sum()
             if self.comm is not None:
-                # Multi-proc output
                 if self.comm.size > 1:
                     n_rank = self.comm.mpi_comm.allgather(n)
                 else:
                     n_rank = [n]
                 Ntot = sum(n_rank)
             else:
-                # Single-proc output
                 n_rank = None
                 Ntot = n
 
-            # Write the datasets for each particle datatype
-            self.write_particles( species_grp, species, n_rank,
-                Ntot, select_array, self.array_quantities_dict[species_name] )
+            if self.rank == 0:
+                species_path = "/data/%d/particles/%s" % (
+                    iteration, species_name)
+                species_grp = f.require_group(species_path)
+                constants = self.constant_quantities_dict[species_name]
+                self.setup_openpmd_species_group(
+                    species_grp, species, constants)
+                record_extent = np.array([Ntot], dtype=np.uint64)
+                for quantity in constants:
+                    species_grp[quantity].attrs["shape"] = record_extent
+                for axis in ("x", "y", "z"):
+                    species_grp["positionOffset/%s" % axis].attrs[
+                        "shape"] = record_extent
+            else:
+                species_grp = None
+
+            self.write_particles(
+                species_grp, species, n_rank, Ntot, select_array,
+                self.array_quantities_dict[species_name])
 
         # Close the file
         if self.rank == 0:

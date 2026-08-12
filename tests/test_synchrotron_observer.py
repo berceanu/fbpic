@@ -2,6 +2,7 @@
 # License: 3-Clause-BSD-LBNL
 """Focused contract tests for observer-frame synchrotron radiation."""
 
+import json
 import math
 from types import SimpleNamespace
 
@@ -11,10 +12,19 @@ import pytest
 from scipy.constants import c, e, epsilon_0, hbar, m_e
 
 from fbpic.main import Simulation
-from fbpic.openpmd_diag import SynchrotronRadiationDiagnostic
+from fbpic.openpmd_diag import (
+    SynchrotronRadiationDiagnostic, merge_radiation_segments,
+    radiation_segment_status, restart_from_checkpoint,
+    set_periodic_checkpoint,
+)
 from fbpic.openpmd_diag.observer_radiation_diag import (
     angular_cell_measure,
+    merge_source_moment_stats,
     source_moment_components,
+    source_z_interval_components,
+)
+from fbpic.openpmd_diag.segment_checkpoint import (
+    atomic_write_json, selected_checkpoint_manifest,
 )
 from fbpic.particles.elementary_process.synchrotron.observer import (
     ObserverFrameRadiationAccumulator,
@@ -26,6 +36,7 @@ from fbpic.particles.elementary_process.synchrotron.radiator import (
     _cached_spectral_cdf,
 )
 from fbpic.particles.particles import Particles
+from fbpic.particles.tracking import ParticleTracker
 from fbpic.particles.push.numba_methods import push_p_numba
 from fbpic.utils.cuda import cuda_installed
 
@@ -1443,3 +1454,480 @@ def test_species_local_particle_ids_use_independent_random_namespaces(tmp_path):
     assert first_sample[0] != second_sample[0]
     assert diagnostic.estimated_total_allocation_bytes == sum(
         item["total_bytes"] for item in diagnostic.memory_estimate.values())
+
+
+def test_restored_particle_ids_advance_the_correct_global_counter():
+    class GatheredMaxima(object):
+        def allgather(self, value):
+            assert value == 7
+            return [4, value, 14]
+
+    communicator = SimpleNamespace(
+        rank=1, size=3, mpi_comm=GatheredMaxima())
+    tracker = ParticleTracker(3, 1, 0)
+    restored = np.array([1, 7], dtype=np.uint64)
+    tracker.overwrite_ids(restored, communicator)
+
+    assert np.array_equal(tracker.id, restored)
+    assert tracker.next_attributed_id == 16
+    assert not hasattr(tracker, "next_attibuted_id")
+    generated = tracker.generate_new_ids(3)
+    assert np.array_equal(generated, np.array([16, 19, 22]))
+    assert not set(generated.tolist()).intersection({1, 4, 7, 14})
+
+    exhausted = ParticleTracker(1, 0, 0)
+    exhausted.overwrite_ids(
+        np.array([np.iinfo(np.uint64).max], dtype=np.uint64),
+        SimpleNamespace(rank=0, size=1, mpi_comm=None))
+    with pytest.raises(OverflowError, match="namespace is exhausted"):
+        exhausted.generate_new_ids(1)
+
+
+def test_legacy_restart_requires_explicit_discontinuous_segment(tmp_path):
+    species = _species(
+        [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0])
+    _activate(species)
+    diagnostic = _diagnostic(
+        tmp_path, species, channels=["accounting"])
+    context = {
+        "initial": True,
+        "restart": True,
+        "legacy": True,
+        "run_id": "simulation-run",
+        "checkpoint_id": None,
+        "checkpoint_iteration": 5,
+        "iteration": 5,
+        "segments": [],
+    }
+
+    with pytest.raises(RuntimeError, match="restart_policy='new_segment'"):
+        diagnostic.start_segment(context)
+    diagnostic.restart_policy = "new_segment"
+    assert diagnostic.start_segment(context)
+    assert diagnostic.segment_status == "open"
+    assert diagnostic._segment_event_begin == 5
+    assert diagnostic._segment_run_id != context["run_id"]
+    assert diagnostic._segment_continuity == (
+        "discontinuous_legacy_restart")
+
+    missing_manifest = tmp_path / "missing-commit.json"
+    reference = diagnostic.close_segment({
+        "checkpoint_id": None,
+        "checkpoint_iteration": None,
+        "event_end_exclusive": 5,
+        "close_reason": "finalize",
+        "commit_manifest": str(missing_manifest),
+    })
+    assert diagnostic.segment_status == "closed"
+    assert radiation_segment_status(reference["path"]) == "orphaned"
+    with pytest.raises(RuntimeError, match="not committed"):
+        merge_radiation_segments(
+            [reference["path"]], tmp_path / "must-not-merge.h5")
+
+
+def test_preparing_checkpoint_manifest_is_never_accepted_as_legacy(tmp_path):
+    manifest_dir = tmp_path / "manifests"
+    manifest_dir.mkdir()
+    atomic_write_json(
+        str(manifest_dir / "checkpoint00000004.json"), {
+            "checkpointManifestSchemaVersion": 1,
+            "checkpointStatus": "preparing",
+            "iteration": 4,
+        })
+    with pytest.raises(RuntimeError, match="not committed"):
+        selected_checkpoint_manifest(str(tmp_path), 4)
+
+
+def test_checkpoint_restart_creates_exact_mergeable_radiation_segments(
+        tmp_path):
+    def build_simulation():
+        simulation = Simulation(
+            8, 8.0e-6, 2, 2.0e-6, 1, 0.5e-6 / c, zmin=0.0,
+            boundaries={"z": "periodic", "r": "reflective"},
+            verbose_level=0)
+        particles = simulation.add_new_species(
+            -e, m_e, n=1.0e18, p_nz=1, p_nr=1, p_nt=1,
+            p_rmax=1.5e-6, uz_m=12.0,
+            continuous_injection=False)
+        return simulation, particles
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    radiation_dir = tmp_path / "radiation"
+    simulation, species = build_simulation()
+
+    # Registering checkpoints before the radiation diagnostic exercises the
+    # late tracker-activation path: IDs still have to enter the checkpoint.
+    set_periodic_checkpoint(
+        simulation, 2, checkpoint_dir=str(checkpoint_dir))
+    species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=7, species={"electrons": species}, comm=simulation.comm,
+        write_dir=str(radiation_dir), channels=["accounting"])
+    simulation.diags = [diagnostic]
+    simulation.step(2, show_progress=False)
+
+    manifest_path = (
+        checkpoint_dir / "manifests" / "checkpoint00000002.json")
+    with open(manifest_path, "r") as source:
+        checkpoint_manifest = json.load(source)
+    assert checkpoint_manifest["checkpointStatus"] == "committed"
+    assert checkpoint_manifest["eventEndExclusive"] == 2
+    assert len(checkpoint_manifest["segments"]) == 1
+    first_reference = checkpoint_manifest["segments"][0]
+    assert (first_reference["eventBegin"],
+            first_reference["eventEndExclusive"]) == (0, 2)
+    assert radiation_segment_status(first_reference["path"]) == "committed"
+    with h5py.File(first_reference["path"], "r") as first_segment:
+        segment_metadata = json.loads(
+            first_segment["metadata/json"][()].decode("utf-8"))
+    frame_times = segment_metadata["frameTimes"]["electrons"]
+    assert frame_times["simulationEventCenterStart"] == pytest.approx(
+        0.5 * simulation.dt)
+    assert frame_times["simulationEventCenterEnd"] == pytest.approx(
+        1.5 * simulation.dt)
+    assert frame_times["simulationImpulseIntervalStart"] == pytest.approx(0.0)
+    assert frame_times["simulationImpulseIntervalEnd"] == pytest.approx(
+        2.0 * simulation.dt)
+    assert diagnostic.get_segment_status()["eventBegin"] == 2
+    assert diagnostic.segment_status == "open"
+
+    restored_ids = species.tracker.id.copy()
+    checkpoint_file = (
+        checkpoint_dir / "proc0" / "hdf5" / "data00000002.h5")
+    with h5py.File(checkpoint_file, "r") as checkpoint:
+        particle_group = checkpoint["data/2/particles/species 0"]
+        assert particle_group["id"].shape == restored_ids.shape
+        assert tuple(particle_group["mass"].attrs["shape"]) == (
+            restored_ids.size,)
+        assert "radiationState" not in checkpoint
+
+    restarted, restarted_species = build_simulation()
+    restart_from_checkpoint(
+        restarted, iteration=2, checkpoint_dir=str(checkpoint_dir))
+    assert restarted_species._persistent_ids_restored
+    assert np.array_equal(restarted_species.tracker.id, restored_ids)
+    assert restarted_species.tracker.next_attributed_id > int(
+        restored_ids.max())
+
+    restarted_species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    restarted_diagnostic = SynchrotronRadiationDiagnostic(
+        period=7, species={"electrons": restarted_species},
+        comm=restarted.comm, write_dir=str(radiation_dir),
+        channels=["accounting"])
+    assert restarted_diagnostic.configuration_fingerprint == (
+        diagnostic.configuration_fingerprint)
+    restarted.diags = [restarted_diagnostic]
+    restarted.step(1, show_progress=False)
+    assert restarted.finalize_diagnostics() == 1
+
+    second_reference = restarted_diagnostic.get_segment_status()[
+        "lastClosed"]
+    assert (second_reference["eventBegin"],
+            second_reference["eventEndExclusive"]) == (2, 3)
+    assert second_reference["parentCheckpointId"] == (
+        first_reference["closingCheckpointId"])
+    assert second_reference["runId"] == first_reference["runId"]
+    assert radiation_segment_status(second_reference["path"]) == "committed"
+
+    merged_path = tmp_path / "whole-run-radiation.h5"
+    merge_radiation_segments(
+        [second_reference["path"], first_reference["path"]], merged_path)
+    with h5py.File(merged_path, "r") as merged:
+        assert _attribute_text(merged.attrs["artifactType"]) == (
+            "radiation_merged_whole_run")
+        assert merged.attrs["mergedWholeRun"] == 1
+        assert merged["radiationState/electrons/timing"].attrs[
+            "event_count"] == 3
+        metadata = json.loads(
+            merged["metadata/json"][()].decode("utf-8"))
+        assert [item["eventBegin"] for item in metadata["segments"]] == [0, 2]
+        merged_transverse = merged[
+            "radiationState/electrons/accounting/transverse_energy"][()]
+    with h5py.File(first_reference["path"], "r") as first_segment:
+        first_transverse = first_segment[
+            "radiationState/electrons/accounting/transverse_energy"][()]
+    with h5py.File(second_reference["path"], "r") as second_segment:
+        second_transverse = second_segment[
+            "radiationState/electrons/accounting/transverse_energy"][()]
+    assert np.allclose(
+        merged_transverse, first_transverse + second_transverse,
+        rtol=0.0, atol=0.0)
+
+    suffix_path = tmp_path / "selected-suffix.h5"
+    merge_radiation_segments([second_reference["path"]], suffix_path)
+    with h5py.File(suffix_path, "r") as suffix:
+        assert _attribute_text(suffix.attrs["artifactType"]) == (
+            "radiation_merged_lineage_selection")
+        assert suffix.attrs["mergedWholeRun"] == 0
+
+    with pytest.raises(ValueError, match="Duplicate radiation segment ID"):
+        merge_radiation_segments(
+            [first_reference["path"], first_reference["path"]],
+            tmp_path / "duplicate.h5")
+
+
+
+
+def test_older_checkpoint_restart_orphans_the_abandoned_branch(tmp_path):
+    def configured_simulation():
+        simulation = Simulation(
+            8, 8.0e-6, 2, 2.0e-6, 1, 0.5e-6 / c, zmin=0.0,
+            boundaries={"z": "periodic", "r": "reflective"},
+            verbose_level=0)
+        particles = simulation.add_new_species(
+            -e, m_e, n=1.0e18, p_nz=1, p_nr=1, p_nt=1,
+            p_rmax=1.5e-6, uz_m=12.0,
+            continuous_injection=False)
+        return simulation, particles
+
+    checkpoint_dir = tmp_path / "checkpoints"
+    radiation_dir = tmp_path / "radiation"
+    simulation, species = configured_simulation()
+    species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=9, species={"electrons": species}, comm=simulation.comm,
+        write_dir=str(radiation_dir), channels=["accounting"])
+    simulation.diags = [diagnostic]
+    set_periodic_checkpoint(
+        simulation, 1, checkpoint_dir=str(checkpoint_dir))
+    simulation.step(2, show_progress=False)
+
+    with open(
+            checkpoint_dir / "manifests" / "checkpoint00000001.json",
+            "r") as source:
+        first_checkpoint = json.load(source)
+    with open(
+            checkpoint_dir / "manifests" / "checkpoint00000002.json",
+            "r") as source:
+        abandoned_checkpoint = json.load(source)
+    first = first_checkpoint["segments"][0]
+    abandoned = abandoned_checkpoint["segments"][0]
+    assert radiation_segment_status(first["path"]) == "committed"
+    assert radiation_segment_status(abandoned["path"]) == "committed"
+
+    restarted, restarted_species = configured_simulation()
+    restart_from_checkpoint(
+        restarted, iteration=1, checkpoint_dir=str(checkpoint_dir))
+    restarted_species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    restarted_diagnostic = SynchrotronRadiationDiagnostic(
+        period=9, species={"electrons": restarted_species},
+        comm=restarted.comm, write_dir=str(radiation_dir),
+        channels=["accounting"])
+    restarted.diags = [restarted_diagnostic]
+    set_periodic_checkpoint(
+        restarted, 1, checkpoint_dir=str(checkpoint_dir))
+    restarted.step(1, show_progress=False)
+
+    with open(
+            checkpoint_dir / "manifests" / "checkpoint00000002.json",
+            "r") as source:
+        replacement_checkpoint = json.load(source)
+    replacement = replacement_checkpoint["segments"][0]
+    assert replacement["segmentId"] != abandoned["segmentId"]
+    assert replacement["parentCheckpointId"] == first[
+        "closingCheckpointId"]
+    assert replacement_checkpoint["parentCheckpointId"] == first[
+        "closingCheckpointId"]
+    assert radiation_segment_status(first["path"]) == "committed"
+    assert radiation_segment_status(replacement["path"]) == "committed"
+    assert radiation_segment_status(abandoned["path"]) == "orphaned"
+
+    assert restarted.finalize_diagnostics() == 1
+    terminal = restarted_diagnostic.get_segment_status()["lastClosed"]
+    merged_path = tmp_path / "replacement-branch.h5"
+    merge_radiation_segments(
+        [terminal["path"], replacement["path"], first["path"]],
+        merged_path)
+    with h5py.File(merged_path, "r") as merged:
+        assert _attribute_text(merged.attrs["artifactType"]) == (
+            "radiation_merged_whole_run")
+        assert merged["radiationState/electrons/timing"].attrs[
+            "event_count"] == 2
+def test_merger_combines_sufficient_statistics_and_interval_histograms(
+        tmp_path):
+    species = _species(
+        [0.0, 0.0, 25.0], [1.0e11, 0.0, 0.0],
+        [0.0, 0.0, 0.0], positions=[0.0, 0.0, 2.0e-6])
+    radiator = _activate(species)
+    z_edges = np.linspace(-5.0e-6, 5.0e-6, 11)
+    diagnostic = _diagnostic(
+        tmp_path / "radiation", species,
+        observer_time_edges=np.linspace(-2.0e-12, 2.0e-12, 9),
+        detectors=[{"name": "D", "direction": [0.0, 0.0, 1.0]}],
+        source_coordinate_edges={"z": z_edges},
+        source_moments=[{"name": "all"}],
+        source_z_intervals=(0.5, 0.9),
+        channels=["observer_time", "source_moments", "accounting"])
+    diagnostic.start_segment({
+        "initial": True, "restart": False, "legacy": False,
+        "run_id": "moment-run", "checkpoint_id": None,
+        "checkpoint_iteration": None, "iteration": 0, "segments": [],
+    })
+
+    _complete_impulse(radiator, species, 0.0)
+    checkpoint_manifest = tmp_path / "moment-checkpoint.json"
+    first_reference = diagnostic.close_segment({
+        "checkpoint_id": "moment-checkpoint",
+        "checkpoint_iteration": 1,
+        "event_end_exclusive": 1,
+        "close_reason": "checkpoint",
+        "commit_manifest": str(checkpoint_manifest),
+    })
+    assert radiation_segment_status(first_reference["path"]) == "orphaned"
+    atomic_write_json(str(checkpoint_manifest), {
+        "checkpointStatus": "committed",
+        "checkpointManifestSchemaVersion": 1,
+        "checkpointId": "moment-checkpoint",
+        "parentCheckpointId": None,
+        "parentCheckpointIteration": None,
+        "iteration": 1,
+        "eventEndExclusive": 1,
+        "segments": [first_reference],
+    })
+    diagnostic.start_segment({
+        "run_id": "moment-run",
+        "checkpoint_id": "moment-checkpoint",
+        "checkpoint_iteration": 1,
+        "iteration": 1,
+        "restart": False,
+        "segments": [first_reference],
+    })
+
+    _complete_impulse(radiator, species, species.dt)
+    assert diagnostic.finalize_segment()
+    second_reference = diagnostic.get_segment_status()["lastClosed"]
+    merged_path = tmp_path / "moments-merged.h5"
+    merge_radiation_segments(
+        [first_reference["path"], second_reference["path"]], merged_path)
+
+    with h5py.File(first_reference["path"], "r") as first_file:
+        first_moments = first_file[
+            "radiationState/electrons/moments/all"][()]
+        first_histogram = first_file[
+            "radiationState/electrons/source_z/all"][()]
+        first_detector = first_file[
+            "radiationState/electrons/data/detector/D/direction"][()]
+    with h5py.File(second_reference["path"], "r") as second_file:
+        second_moments = second_file[
+            "radiationState/electrons/moments/all"][()]
+        second_histogram = second_file[
+            "radiationState/electrons/source_z/all"][()]
+        second_detector = second_file[
+            "radiationState/electrons/data/detector/D/direction"][()]
+
+    expected_moments = merge_source_moment_stats(
+        first_moments, second_moments)
+    expected_histogram = first_histogram + second_histogram
+    expected_detector = first_detector + second_detector
+    expected_components = source_moment_components(
+        expected_moments, ("position", "angle", "time"))
+    expected_intervals = source_z_interval_components(
+        expected_histogram, z_edges, (0.5, 0.9))
+
+    with h5py.File(merged_path, "r") as merged:
+        assert np.array_equal(
+            merged["radiationState/electrons/moments/all"][()],
+            expected_moments)
+        assert np.array_equal(
+            merged["radiationState/electrons/source_z/all"][()],
+            expected_histogram)
+        assert np.array_equal(
+            merged[
+                "radiationState/electrons/data/detector/D/direction"][()],
+            expected_detector)
+        derived = merged["derived/electrons/sourceMoments/all"]
+        assert derived["centroid_observer_time"][0] == pytest.approx(
+            expected_components["centroid_observer_time"][0])
+        assert derived["central_50_percent_z_start"][0] == pytest.approx(
+            expected_intervals["central_50_percent_z_start"][0])
+        assert "pulseMetrics/D/direction/interval_duration" in merged[
+            "derived/electrons"]
+
+
+def test_merger_rejects_gaps_overlaps_and_incompatible_configuration(
+        tmp_path):
+    def committed_segment(name, begin, seed=19):
+        particles = _species(
+            [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+            [0.0, 0.0, 0.0])
+        radiator = _activate(particles)
+        diagnostic = _diagnostic(
+            tmp_path / name, particles, channels=["accounting"],
+            random_seed=seed)
+        diagnostic.start_segment({
+            "initial": True,
+            "restart": False,
+            "legacy": False,
+            "run_id": "range-run",
+            "checkpoint_id": None,
+            "checkpoint_iteration": None,
+            "iteration": begin,
+            "segments": [],
+        })
+        _complete_impulse(radiator, particles, begin * particles.dt)
+        diagnostic.finalize_segment()
+        return diagnostic.get_segment_status()["lastClosed"]
+
+    first = committed_segment("first", 0)
+    gap = committed_segment("gap", 2)
+    overlap = committed_segment("overlap", 0)
+    incompatible = committed_segment("incompatible", 1, seed=20)
+
+    with pytest.raises(ValueError, match="Gap between radiation segments"):
+        merge_radiation_segments(
+            [first["path"], gap["path"]], tmp_path / "gap.h5")
+    with pytest.raises(ValueError, match="Overlap between radiation segments"):
+        merge_radiation_segments(
+            [first["path"], overlap["path"]], tmp_path / "overlap.h5")
+    with pytest.raises(ValueError, match="Incompatible radiation configuration"):
+        merge_radiation_segments(
+            [first["path"], incompatible["path"]],
+            tmp_path / "incompatible.h5")
+
+    shape_mismatch = committed_segment("shape-mismatch", 1)
+    accounting_path = (
+        "radiationState/electrons/accounting/transverse_energy")
+    with h5py.File(shape_mismatch["path"], "r+") as segment:
+        original = np.atleast_1d(np.asarray(segment[accounting_path][()]))
+        del segment[accounting_path]
+        segment.create_dataset(
+            accounting_path, data=np.concatenate((original, original)))
+        commit_manifest = _attribute_text(segment.attrs["commitManifest"])
+    with pytest.raises(ValueError, match="accounting shape"):
+        merge_radiation_segments(
+            [first["path"], shape_mismatch["path"]],
+            tmp_path / "shape-mismatch.h5")
+
+    with open(commit_manifest, "r") as source:
+        corrupted_manifest = json.load(source)
+    corrupted_manifest["segments"][0]["eventEndExclusive"] = 99
+    atomic_write_json(commit_manifest, corrupted_manifest)
+    assert radiation_segment_status(shape_mismatch["path"]) == "orphaned"
+
+
+def test_configuration_fingerprint_excludes_runtime_decomposition_details(
+        tmp_path):
+    def configured(name, batch_size, communicator_size, seed=13):
+        particles = _species(
+            [0.0, 0.0, 20.0], [1.0e11, 0.0, 0.0],
+            [0.0, 0.0, 0.0])
+        _activate(particles)
+        return SynchrotronRadiationDiagnostic(
+            period=1, species={"electrons": particles},
+            comm=SimpleNamespace(rank=0, size=communicator_size),
+            write_dir=str(tmp_path / name), channels=["accounting"],
+            particle_batch_size=batch_size, random_seed=seed)
+
+    serial = configured("serial", 1, 1)
+    decomposed = configured("decomposed", 64, 4)
+    different_seed = configured("different-seed", 1, 1, seed=14)
+
+    assert serial.configuration_fingerprint == (
+        decomposed.configuration_fingerprint)
+    assert serial.configuration_fingerprint != (
+        different_seed.configuration_fingerprint)

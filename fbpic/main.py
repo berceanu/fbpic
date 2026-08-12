@@ -24,7 +24,9 @@ if cuda_installed:
 
 # Import the rest of the requirements
 import sys
+import uuid
 import warnings
+import weakref
 import numba
 import numpy as np
 from scipy.constants import m_e, m_p, e, c
@@ -34,6 +36,14 @@ from .particles.injection.continuous_injection import _check_dens_func_arguments
 from .lpa_utils.boosted_frame import BoostConverter
 from .fields import Fields
 from .boundaries import BoundaryCommunicator, MovingWindow
+
+def _new_run_id(comm):
+    """Return one run identifier per simulation communicator."""
+    value = uuid.uuid4().hex if comm.rank == 0 else None
+    if comm.mpi_comm is not None:
+        value = comm.mpi_comm.bcast(value, root=0)
+    return value
+
 
 class Simulation(object):
     """
@@ -334,6 +344,13 @@ class Simulation(object):
         # Initialize an empty list of diagnostics and checkpoints
         # (Checkpoints are used for restarting the simulation)
         self.diags = []
+        # Small checkpoint/diagnostic lineage state. Large diagnostic arrays
+        # deliberately remain owned by diagnostics and never enter checkpoints.
+        self._run_id = _new_run_id(self.comm)
+        self._checkpoint_parent_id = None
+        self._checkpoint_parent_iteration = None
+        self._checkpoint_restart_context = None
+        self._initialized_segment_diagnostics = weakref.WeakSet()
         self.checkpoints = []
         # Initialize an empty list of laser antennas
         self.laser_antennas = []
@@ -342,6 +359,38 @@ class Simulation(object):
 
         # Print simulation setup
         print_simulation_setup( self, verbose_level=verbose_level )
+
+    def _prepare_diagnostic_segments(self):
+        """Initialize optional segmented diagnostics without type coupling."""
+        restart_context = self._checkpoint_restart_context
+        if restart_context is None:
+            context = {
+                "restart": False,
+                "legacy": False,
+                "run_id": self._run_id,
+                "checkpoint_id": self._checkpoint_parent_id,
+                "checkpoint_iteration": self._checkpoint_parent_iteration,
+                "iteration": int(self.iteration),
+                "segments": [],
+            }
+        else:
+            context = dict(restart_context)
+        context["initial"] = True
+        context["iteration"] = int(self.iteration)
+
+        for diagnostic in self.diags:
+            start = getattr(diagnostic, "start_segment", None)
+            if (start is not None
+                    and diagnostic not in
+                    self._initialized_segment_diagnostics):
+                start(context)
+                self._initialized_segment_diagnostics.add(diagnostic)
+
+        for diagnostic in self.diags:
+            prepare = getattr(diagnostic, "prepare_step", None)
+            if prepare is not None:
+                prepare(int(self.iteration))
+
 
     def step(self, N=1, correct_currents=True,
              correct_divE=False, use_true_rho=False,
@@ -387,6 +436,8 @@ class Simulation(object):
                             'with `correct_currents` in multi-proc mode.')
             # This is because use_true_rho requires the guard cells of
             # rho to be exchanged while correct_currents requires the opposite.
+
+        self._prepare_diagnostic_segments()
 
         # Initialize the positions for continuous injection by moving window
         if self.comm.moving_win is not None:
@@ -611,18 +662,17 @@ class Simulation(object):
 
 
     def finalize_diagnostics(self):
-        """Explicitly finalize dirty observer-radiation diagnostics.
+        """Explicitly finalize diagnostics that provide a lifecycle hook.
 
         Normal :meth:`step` calls never invoke this operation. Repeated calls
-        are safe and write only diagnostics with a completed, unwritten event.
-        The return value is the number of files written on this call.
+        are expected to be idempotent. The return value is the number of
+        diagnostics that wrote or committed new output on this call.
         """
         writes = 0
-        for diag in self.diags:
-            if (getattr(diag, "write_after_momentum_push", False)
-                    and hasattr(diag, "finalize")):
-                if diag.finalize():
-                    writes += 1
+        for diagnostic in self.diags:
+            finalize = getattr(diagnostic, "finalize", None)
+            if finalize is not None and finalize():
+                writes += 1
         return writes
 
 

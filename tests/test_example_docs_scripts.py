@@ -108,10 +108,15 @@ def run_sim( script_name, n_MPI, checked_fields, test_checkpoint_dir=False ):
         script = replace_string( script,
             'set_periodic_checkpoint\( sim, checkpoint_period \)',
             'set_periodic_checkpoint( sim, checkpoint_period, checkpoint_dir="%s" )'%checkpoint_dir)
-        script = replace_string( script, 'restart_from_checkpoint\( sim \)',
-         'restart_from_checkpoint( sim, checkpoint_dir="%s" )'%checkpoint_dir)
+        script = replace_string(
+            script, 'restart_from_checkpoint\\( sim \\)',
+            'restart_from_checkpoint( sim, iteration=200, '
+            'checkpoint_dir="%s" )' % checkpoint_dir)
     else:
         checkpoint_dir = './checkpoints'
+        script = replace_string(
+            script, 'restart_from_checkpoint\\( sim \\)',
+            'restart_from_checkpoint( sim, iteration=200 )')
 
     script = replace_string( script, 'track_electrons = False',
                                 'track_electrons = True')

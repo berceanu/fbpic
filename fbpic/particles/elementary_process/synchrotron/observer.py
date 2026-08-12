@@ -2588,6 +2588,28 @@ class ObserverFrameRadiationAccumulator(object):
         raise RuntimeError(
             "Use accumulate_impulse with a completed momentum-push interval.")
 
+    def reset_segment_state(self):
+        """Zero mergeable segment state after a committed boundary.
+
+        The lifetime completion counter and last absolute event index remain
+        monotonic. They are small identity/ordering guards, not persisted
+        radiation state; segment event counts live in ``cumulative_timing``.
+        """
+        if self._on_gpu:
+            raise RuntimeError(
+                "Receive observer radiation from the GPU before resetting.")
+        for storage in (
+                self.data, self.accounting, self.sampling,
+                self.source_z_histograms, self.quality,
+                self.interval_quality, self.resolution_stats,
+                self.interval_resolution_stats, self.moment_stats,
+                self.interval_moment_stats):
+            for value in storage.values():
+                value.fill(0.0)
+        self.cumulative_timing = self._empty_timing()
+        self.interval_timing = self._empty_timing()
+
+
     def snapshot(self, interval_moments=False):
         """Return a host-side copy of cumulative or interval-only state."""
         if self._on_gpu:
