@@ -3,6 +3,7 @@
 """Focused contract tests for observer-frame synchrotron radiation."""
 
 import json
+import os
 import math
 from types import SimpleNamespace
 
@@ -24,7 +25,8 @@ from fbpic.openpmd_diag.observer_radiation_diag import (
     source_z_interval_components,
 )
 from fbpic.openpmd_diag.segment_checkpoint import (
-    atomic_write_json, selected_checkpoint_manifest,
+    atomic_write_json, resolve_file_reference, resolved_segment_reference,
+    selected_checkpoint_manifest,
 )
 from fbpic.particles.elementary_process.synchrotron.observer import (
     ObserverFrameRadiationAccumulator,
@@ -1575,7 +1577,10 @@ def test_checkpoint_restart_creates_exact_mergeable_radiation_segments(
     assert checkpoint_manifest["checkpointStatus"] == "committed"
     assert checkpoint_manifest["eventEndExclusive"] == 2
     assert len(checkpoint_manifest["segments"]) == 1
-    first_reference = checkpoint_manifest["segments"][0]
+    first_stored = checkpoint_manifest["segments"][0]
+    assert not os.path.isabs(first_stored["path"])
+    first_reference = resolved_segment_reference(
+        first_stored, manifest_path)
     assert (first_reference["eventBegin"],
             first_reference["eventEndExclusive"]) == (0, 2)
     assert radiation_segment_status(first_reference["path"]) == "committed"
@@ -1644,6 +1649,10 @@ def test_checkpoint_restart_creates_exact_mergeable_radiation_segments(
         metadata = json.loads(
             merged["metadata/json"][()].decode("utf-8"))
         assert [item["eventBegin"] for item in metadata["segments"]] == [0, 2]
+        assert all(
+            not os.path.isabs(item["path"])
+            and not os.path.isabs(item["commitManifest"])
+            for item in metadata["segments"])
         merged_transverse = merged[
             "radiationState/electrons/accounting/transverse_energy"][()]
     with h5py.File(first_reference["path"], "r") as first_segment:
@@ -1671,6 +1680,77 @@ def test_checkpoint_restart_creates_exact_mergeable_radiation_segments(
 
 
 
+def test_checkpoint_radiation_tree_remains_valid_after_relocation(tmp_path):
+    def configured_simulation():
+        simulation = Simulation(
+            8, 8.0e-6, 2, 2.0e-6, 1, 0.5e-6 / c, zmin=0.0,
+            boundaries={"z": "periodic", "r": "reflective"},
+            verbose_level=0)
+        particles = simulation.add_new_species(
+            -e, m_e, n=1.0e18, p_nz=1, p_nr=1, p_nt=1,
+            p_rmax=1.5e-6, uz_m=12.0,
+            continuous_injection=False)
+        return simulation, particles
+
+    campaign = tmp_path / "campaign"
+    checkpoint_dir = campaign / "checkpoints"
+    radiation_dir = campaign / "radiation"
+    simulation, species = configured_simulation()
+    species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    diagnostic = SynchrotronRadiationDiagnostic(
+        period=7, species={"electrons": species}, comm=simulation.comm,
+        write_dir=str(radiation_dir), channels=["accounting"])
+    simulation.diags = [diagnostic]
+    set_periodic_checkpoint(
+        simulation, 1, checkpoint_dir=str(checkpoint_dir))
+    simulation.step(1, show_progress=False)
+
+    relocated = tmp_path / "relocated-campaign"
+    campaign.rename(relocated)
+    checkpoint_dir = relocated / "checkpoints"
+    radiation_dir = relocated / "radiation"
+    manifest_path = (
+        checkpoint_dir / "manifests" / "checkpoint00000001.json")
+    manifest = selected_checkpoint_manifest(str(checkpoint_dir), 1)
+    stored_reference = manifest["segments"][0]
+    assert not os.path.isabs(stored_reference["path"])
+    first_reference = resolved_segment_reference(
+        stored_reference, manifest_path)
+    assert radiation_segment_status(first_reference["path"]) == "committed"
+    with h5py.File(first_reference["path"], "r") as segment:
+        stored_commit = _attribute_text(segment.attrs["commitManifest"])
+    assert not os.path.isabs(stored_commit)
+    assert resolve_file_reference(
+        stored_commit, first_reference["path"]) == str(manifest_path)
+
+    restarted, restarted_species = configured_simulation()
+    restart_from_checkpoint(
+        restarted, iteration=1, checkpoint_dir=str(checkpoint_dir))
+    restarted_species.activate_synchrotron(
+        gamma_cutoff=2.0, x_max=4.0, n_samples=32)
+    restarted_diagnostic = SynchrotronRadiationDiagnostic(
+        period=7, species={"electrons": restarted_species},
+        comm=restarted.comm, write_dir=str(radiation_dir),
+        channels=["accounting"])
+    restarted.diags = [restarted_diagnostic]
+    restarted.step(1, show_progress=False)
+    assert restarted.finalize_diagnostics() == 1
+    terminal = restarted_diagnostic.get_segment_status()["lastClosed"]
+
+    merged_path = relocated / "whole-run.h5"
+    merge_radiation_segments(
+        [terminal["path"], first_reference["path"]], merged_path)
+    with h5py.File(merged_path, "r") as merged:
+        assert _attribute_text(merged.attrs["artifactType"]) == (
+            "radiation_merged_whole_run")
+        metadata = json.loads(merged["metadata/json"][()].decode("utf-8"))
+        assert all(
+            not os.path.isabs(item["path"])
+            and not os.path.isabs(item["commitManifest"])
+            for item in metadata["segments"])
+
+
 def test_older_checkpoint_restart_orphans_the_abandoned_branch(tmp_path):
     def configured_simulation():
         simulation = Simulation(
@@ -1696,16 +1776,21 @@ def test_older_checkpoint_restart_orphans_the_abandoned_branch(tmp_path):
         simulation, 1, checkpoint_dir=str(checkpoint_dir))
     simulation.step(2, show_progress=False)
 
-    with open(
-            checkpoint_dir / "manifests" / "checkpoint00000001.json",
-            "r") as source:
+    first_manifest_path = (
+        checkpoint_dir / "manifests" / "checkpoint00000001.json")
+    abandoned_manifest_path = (
+        checkpoint_dir / "manifests" / "checkpoint00000002.json")
+    with open(first_manifest_path, "r") as source:
         first_checkpoint = json.load(source)
-    with open(
-            checkpoint_dir / "manifests" / "checkpoint00000002.json",
-            "r") as source:
+    with open(abandoned_manifest_path, "r") as source:
         abandoned_checkpoint = json.load(source)
-    first = first_checkpoint["segments"][0]
-    abandoned = abandoned_checkpoint["segments"][0]
+    first_stored = first_checkpoint["segments"][0]
+    abandoned_stored = abandoned_checkpoint["segments"][0]
+    assert not os.path.isabs(first_stored["path"])
+    assert not os.path.isabs(abandoned_stored["path"])
+    first = resolved_segment_reference(first_stored, first_manifest_path)
+    abandoned = resolved_segment_reference(
+        abandoned_stored, abandoned_manifest_path)
     assert radiation_segment_status(first["path"]) == "committed"
     assert radiation_segment_status(abandoned["path"]) == "committed"
 
@@ -1723,11 +1808,14 @@ def test_older_checkpoint_restart_orphans_the_abandoned_branch(tmp_path):
         restarted, 1, checkpoint_dir=str(checkpoint_dir))
     restarted.step(1, show_progress=False)
 
-    with open(
-            checkpoint_dir / "manifests" / "checkpoint00000002.json",
-            "r") as source:
+    replacement_manifest_path = (
+        checkpoint_dir / "manifests" / "checkpoint00000002.json")
+    with open(replacement_manifest_path, "r") as source:
         replacement_checkpoint = json.load(source)
-    replacement = replacement_checkpoint["segments"][0]
+    replacement_stored = replacement_checkpoint["segments"][0]
+    assert not os.path.isabs(replacement_stored["path"])
+    replacement = resolved_segment_reference(
+        replacement_stored, replacement_manifest_path)
     assert replacement["segmentId"] != abandoned["segmentId"]
     assert replacement["parentCheckpointId"] == first[
         "closingCheckpointId"]
@@ -1898,6 +1986,8 @@ def test_merger_rejects_gaps_overlaps_and_incompatible_configuration(
         segment.create_dataset(
             accounting_path, data=np.concatenate((original, original)))
         commit_manifest = _attribute_text(segment.attrs["commitManifest"])
+    commit_manifest = resolve_file_reference(
+        commit_manifest, shape_mismatch["path"])
     with pytest.raises(ValueError, match="accounting shape"):
         merge_radiation_segments(
             [first["path"], shape_mismatch["path"]],

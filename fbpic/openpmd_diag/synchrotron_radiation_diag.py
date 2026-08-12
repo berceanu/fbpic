@@ -17,7 +17,10 @@ from .radiation_segments import (
     code_revision, diagnostic_configuration, radiation_segment_status,
     write_segment,
 )
-from .segment_checkpoint import atomic_write_json
+from .segment_checkpoint import (
+    atomic_write_json, relative_file_reference,
+    relative_segment_reference,
+)
 
 def _stable_random_namespace(name):
     """Return a reproducible uint64 namespace for one output species."""
@@ -715,7 +718,7 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             "configurationFingerprint": self.configuration_fingerprint,
             "randomness": random_namespaces,
             "persistentParticleIdentity": "fbpic_particle_tracker_uint64",
-            "commitManifest": os.path.abspath(context["commit_manifest"]),
+            "commitManifest": context["commit_manifest"],
             "codeRevision": self.code_revision,
         }
 
@@ -744,6 +747,8 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         if self.rank == 0:
             metadata = self._segment_metadata(
                 context, begin, end, states)
+            metadata["commitManifest"] = relative_file_reference(
+                context["commit_manifest"], path)
             write_segment(
                 path, metadata, self.segment_configuration,
                 self.configuration_fingerprint, states)
@@ -811,7 +816,8 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
             "diagnosticId": self.diagnostic_id,
             "configurationFingerprint": self.configuration_fingerprint,
             "eventEndExclusive": event_end,
-            "segments": [reference],
+            "segments": [
+                relative_segment_reference(reference, manifest_path)],
         }
         if self.rank == 0:
             atomic_write_json(manifest_path, manifest)

@@ -17,7 +17,8 @@ from .particle_diag import ParticleDiagnostic
 from fbpic.utils.mpi import comm
 from .segment_checkpoint import (
     CheckpointSet, active_manifest_path, atomic_write_json,
-    collective_uuid, selected_checkpoint_manifest,
+    checkpoint_manifest_path, collective_uuid, resolved_segment_reference,
+    selected_checkpoint_manifest,
 )
 from fbpic.particles.tracking import ParticleTracker
 
@@ -234,6 +235,11 @@ simulation or sim.ptcl = [] to remove them""".format(len(avail_species),
             "segments": [],
         }
     else:
+        selected_manifest_path = checkpoint_manifest_path(
+            checkpoint_dir, checkpoint_manifest["iteration"])
+        segment_references = [
+            resolved_segment_reference(reference, selected_manifest_path)
+            for reference in checkpoint_manifest.get("segments", [])]
         restart_context = {
             "restart": True,
             "legacy": False,
@@ -241,7 +247,7 @@ simulation or sim.ptcl = [] to remove them""".format(len(avail_species),
             "checkpoint_id": checkpoint_manifest["checkpointId"],
             "checkpoint_iteration": int(checkpoint_manifest["iteration"]),
             "iteration": int(checkpoint_manifest["iteration"]),
-            "segments": list(checkpoint_manifest.get("segments", [])),
+            "segments": segment_references,
             "checkpoint_manifest": checkpoint_manifest,
         }
         if comm.rank == 0:

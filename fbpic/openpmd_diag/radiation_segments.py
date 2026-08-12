@@ -13,6 +13,9 @@ import h5py
 import numpy as np
 
 from fbpic import __version__ as fbpic_version
+from .segment_checkpoint import (
+    relative_file_reference, resolve_file_reference,
+)
 
 
 RADIATION_SEGMENT_SCHEMA_VERSION = 1
@@ -298,7 +301,7 @@ def write_segment(path, metadata, descriptor, fingerprint, states):
     return path
 
 
-def _manifest_references_segment(manifest, identity):
+def _manifest_references_segment(manifest, identity, manifest_path):
     """Verify the complete segment/checkpoint commit relationship."""
     expected_path = os.path.abspath(identity["path"])
     identity_keys = (
@@ -308,7 +311,10 @@ def _manifest_references_segment(manifest, identity):
         "configurationFingerprint", "closeReason",
     )
     for reference in manifest.get("segments", []):
-        if os.path.abspath(reference.get("path", "")) != expected_path:
+        stored_path = reference.get("path")
+        if (not stored_path
+                or resolve_file_reference(stored_path, manifest_path)
+                != expected_path):
             continue
         if any(reference.get(key) != identity[key]
                for key in identity_keys):
@@ -402,11 +408,15 @@ def radiation_segment_status(path):
                 source.attrs.get("closeReason", ""))
             if metadata.get("closeReason") != close_reason:
                 return "orphaned"
-            manifest_path = _attribute_text(
+            stored_manifest_path = _attribute_text(
                 source.attrs.get("commitManifest", ""))
-            if (not manifest_path
-                    or os.path.abspath(metadata.get("commitManifest", ""))
-                    != os.path.abspath(manifest_path)):
+            metadata_manifest_path = metadata.get("commitManifest", "")
+            if (not stored_manifest_path or not metadata_manifest_path):
+                return "orphaned"
+            manifest_path = resolve_file_reference(
+                stored_manifest_path, path)
+            if resolve_file_reference(metadata_manifest_path, path) != (
+                    manifest_path):
                 return "orphaned"
             identity = dict(attributes)
             identity.update({
@@ -428,7 +438,7 @@ def radiation_segment_status(path):
             manifest = json.load(source)
     except (OSError, ValueError):
         return "orphaned"
-    if _manifest_references_segment(manifest, identity):
+    if _manifest_references_segment(manifest, identity, manifest_path):
         return "committed"
     return "orphaned"
 
@@ -644,6 +654,20 @@ def _write_derived(output, states, descriptor):
                 dataset.attrs["unitDimension"] = dimension
 
 
+def _merged_segment_reference(record, output_path):
+    """Express one source segment's lineage paths from the merged file."""
+    metadata = dict(record["metadata"])
+    metadata["path"] = relative_file_reference(
+        record["path"], output_path)
+    commit_reference = metadata.get("commitManifest")
+    if commit_reference:
+        commit_path = resolve_file_reference(
+            commit_reference, record["path"])
+        metadata["commitManifest"] = relative_file_reference(
+            commit_path, output_path)
+    return metadata
+
+
 def merge_radiation_segments(segment_paths, output_path):
     """Strictly merge one selected, committed radiation lineage.
 
@@ -721,7 +745,7 @@ def merge_radiation_segments(segment_paths, output_path):
         "eventEndExclusive":
             int(records[-1]["metadata"]["eventEndExclusive"]),
         "segments": [
-            dict(item["metadata"], path=item["path"])
+            _merged_segment_reference(item, output_path)
             for item in records],
         "seamless": bool(origin and transitions_are_seamless),
         "completeLineage": complete_lineage,

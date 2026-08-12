@@ -330,6 +330,11 @@ not contain these arrays. A small checkpoint manifest is published only after
 both the simulation payload and every diagnostic segment have closed, making
 an unreferenced or partially written segment orphaned and unacceptable by
 default.
+Checkpoint manifests reference segments relative to the manifest file, and a
+segment references its commit manifest relative to the segment file. Merged
+outputs likewise retain relative source-segment references. Moving the complete
+checkpoint/radiation directory tree therefore preserves these links; legacy
+absolute references are still accepted.
 
 A restart reconstructs the diagnostic from its input configuration, verifies
 its deterministic compatibility fingerprint and restored persistent particle

@@ -43,6 +43,41 @@ def read_json(path):
         return json.load(source)
 
 
+def resolve_file_reference(reference, containing_file):
+    """Resolve a path relative to the metadata file that contains it.
+
+    Absolute paths remain supported for existing manifests. New output uses
+    relative references so a complete output tree can be relocated unchanged.
+    """
+    if os.path.isabs(reference):
+        return os.path.normpath(reference)
+    return os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(containing_file)), reference))
+
+
+def relative_file_reference(target, containing_file):
+    """Return a relocatable reference from one metadata file to another."""
+    return os.path.relpath(
+        os.path.abspath(target),
+        os.path.dirname(os.path.abspath(containing_file)))
+
+
+def relative_segment_reference(reference, manifest_path):
+    """Copy a runtime segment reference for persistence in a manifest."""
+    persisted = dict(reference)
+    persisted["path"] = relative_file_reference(
+        reference["path"], manifest_path)
+    return persisted
+
+
+def resolved_segment_reference(reference, manifest_path):
+    """Copy a persisted segment reference for use by live diagnostics."""
+    resolved = dict(reference)
+    resolved["path"] = resolve_file_reference(
+        reference["path"], manifest_path)
+    return resolved
+
+
 def manifest_directory(checkpoint_dir):
     return os.path.join(os.path.abspath(checkpoint_dir), "manifests")
 
@@ -82,7 +117,10 @@ def selected_checkpoint_manifest(checkpoint_dir, iteration=None):
                 "A committed checkpoint payload is missing: %s"
                 % checkpoint_path)
     for reference in manifest.get("segments", []):
-        segment_path = reference.get("path")
+        stored_path = reference.get("path")
+        segment_path = (
+            None if not stored_path
+            else resolve_file_reference(stored_path, path))
         if not segment_path or not os.path.isfile(segment_path):
             raise RuntimeError(
                 "A committed diagnostic segment is missing from the selected "
@@ -188,6 +226,9 @@ class CheckpointSet(object):
                 if reference is not None:
                     segment_references.append(reference)
 
+        persisted_segment_references = [
+            relative_segment_reference(reference, manifest_path)
+            for reference in segment_references]
         manifest = {
             "checkpointManifestSchemaVersion": _CHECKPOINT_MANIFEST_SCHEMA,
             "checkpointStatus": "committed",
@@ -199,7 +240,7 @@ class CheckpointSet(object):
             "iteration": int(iteration),
             "eventEndExclusive": int(iteration),
             "checkpointFiles": checkpoint_files,
-            "segments": segment_references,
+            "segments": persisted_segment_references,
         }
         if comm.rank == 0:
             atomic_write_json(manifest_path, manifest)

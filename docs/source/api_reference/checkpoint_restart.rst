@@ -23,6 +23,9 @@ checkpoint, parent checkpoint, exact completed iteration, payload files, and
 closed diagnostic segments. ``active.json`` selects the default restart head;
 restarting an older explicit iteration moves that pointer to the selected
 history, so files from a later abandoned branch are not selected implicitly.
+Segment paths are stored relative to the manifest that contains them. Existing
+absolute references remain readable. A checkpoint/radiation output bundle can
+therefore be relocated when its internal directory layout is preserved.
 
 A ``preparing`` manifest is published before any payload is mutated, and its
 ``committed`` replacement is written last. A crash can therefore leave a
