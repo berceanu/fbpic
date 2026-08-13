@@ -280,7 +280,7 @@ class SynchrotronRadiationDiagnostic(OpenPMDDiagnostic):
         dset.attrs["gammaThreshold"] = radiator.gamma_cutoff
         dset.attrs["gammaThresholdFrame"] = np.bytes_("laboratory")
         dset.attrs["accelerationSource"] = np.bytes_(
-            "Lorentz_force_from_gathered_EB_fields")
+            "Lorentz_force_from_particle_local_EB_fields")
         dset.attrs["picEventTimeStaggering"] = np.bytes_(
             "integer_time_gathered_fields_with_half_step_momentum")
         dset.attrs["spectralModel"] = np.bytes_(

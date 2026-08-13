@@ -1326,7 +1326,9 @@ def test_openpmd_unequal_lab_axes_metadata(tmp_path):
             ),
             "photonEnergyDefinition": b"E_photon=hbar*omega_observer",
             "gammaThresholdFrame": b"laboratory",
-            "accelerationSource": b"Lorentz_force_from_gathered_EB_fields",
+            "accelerationSource": (
+                b"Lorentz_force_from_particle_local_EB_fields"
+            ),
             "picEventTimeStaggering": (
                 b"integer_time_gathered_fields_with_half_step_momentum"
             ),

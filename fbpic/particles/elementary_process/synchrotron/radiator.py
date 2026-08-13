@@ -14,7 +14,8 @@ from scipy.integrate import IntegrationWarning
 import warnings
 
 from ..cuda_numba_utils import allocate_empty
-from .numba_methods import gather_synchrotron_numba
+from .numba_methods import gather_synchrotron_numba, \
+    gather_synchrotron_numba_boosted
 
 warnings.simplefilter('ignore', category=NumbaPerformanceWarning)
 warnings.simplefilter('ignore', category=IntegrationWarning)
@@ -236,19 +237,33 @@ class SynchrotronRadiator(object):
             spect_loc = allocate_empty( (self.N_omega,), self.use_cuda,
                                         dtype=np.double )
 
-            # radiation calculation (parallel loop over particles)
-            gather_synchrotron_numba(
-                eon.Ntot,
-                eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
-                eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
-                self.Larmore_factor_density,
-                self.Larmore_factor_momentum,
-                self.gamma_cutoff_inv, self.radiation_reaction,
-                self.gamma_boost, self.beta_boost,
-                self.omega_ax, self.S_func_dx, self.S_func_data,
-                self.theta_x_min, self.theta_x_max, self.d_theta_x,
-                self.theta_y_min, self.theta_y_max, self.d_theta_y,
-                spect_loc, self.radiation_data)
+            # Dispatch once so that the unboosted hot loop remains free of
+            # per-particle frame checks and transformation calls.
+            if self.beta_boost == 0.0:
+                gather_synchrotron_numba(
+                    eon.Ntot,
+                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
+                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
+                    self.Larmore_factor_density,
+                    self.Larmore_factor_momentum,
+                    self.gamma_cutoff_inv, self.radiation_reaction,
+                    self.omega_ax, self.S_func_dx, self.S_func_data,
+                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
+                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
+                    spect_loc, self.radiation_data)
+            else:
+                gather_synchrotron_numba_boosted(
+                    eon.Ntot,
+                    eon.ux, eon.uy, eon.uz, eon.Ex, eon.Ey, eon.Ez,
+                    eon.Bx, eon.By, eon.Bz, eon.w, eon.inv_gamma,
+                    self.Larmore_factor_density,
+                    self.Larmore_factor_momentum,
+                    self.gamma_cutoff_inv,
+                    self.gamma_boost, self.beta_boost,
+                    self.omega_ax, self.S_func_dx, self.S_func_data,
+                    self.theta_x_min, self.theta_x_max, self.d_theta_x,
+                    self.theta_y_min, self.theta_y_max, self.d_theta_y,
+                    spect_loc, self.radiation_data)
 
     def send_to_gpu( self ):
         """
